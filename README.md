@@ -1,21 +1,58 @@
-# Sing-Rules
+# sing-rules
 
-自用的八音盒规则集
+将按匹配范围决定优先级的路由表编译成 sing-box JSON。V1 支持一张 `default` 表。
 
-## mine 文件夹
+```text
+ruleset cn = url("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.json")
+ruleset ads = file("./rules/ads.json")
 
-该文件夹下是所有由我决定源站部署位置的网站，每个文件里都有域名和 IP 规则。
+outbound {
+    Proxy
+    Direct
+    Aliyun
+}
 
-其中，`all` 是所有的网站和 IP，`CNopt` 指服务器不在大陆但大陆大多数地区访问较快（TLS 握手全国平均一秒内完成）
+table default {
+    IP, 1.1.1.1/32, Proxy
+    2001:db8::1, Direct
+    a.com, Direct
+    *.a.com, Aliyun
+    RuleSet, cn, Aliyun
+    RuleSet, ads, REJECT
+    RuleSet, PrivateIP, Direct
+    *, Proxy
+}
+```
 
-剩下的是按国家分的。
+## 编译
 
-在这个目录下，任何一个文件所对应的集合，都是 `all` 文件所对应的集合的子集，除此之外，`all` 也包含了其他集合中不存在的元素。
+```sh
+cargo run --locked -- compile routes.rules --base sing-box.json -o compiled.json
+sing-box check -c compiled.json
+```
 
-具体地说，就是，任何一个非 `all` 能匹配上的规则，一定能被 `all` 匹配，但 `all` 能匹配上的，不一定能被非 `all` 规则匹配（就算你把所有非 `all` 做或运算）
+基础配置提供入站、出站和 DNS 等配置。 `outbound` 块声明表可以引用的出站标签，名称与基础配置的 `tag` 一致。 `REJECT` 是内置动作。省略 `-o` 时输出到标准输出。基础配置已有路由规则时，用 `--replace-route` 明确替换整组 `route.rules`。DSL 管理 `route.rules` 和 `route.final`，基础配置中其他字段会保留。
 
----
+## 语法和优先级
 
-## 以后
+- 一行一个匹配项，格式为 `[类型,] 匹配内容, 出站`。可显式写 `IP`、`Domain`、`DomainSuffix`、`RuleSet` 或 `Any`。规则集始终写 `RuleSet, 名称, 出站`。
+- 裸地址分别按 IPv4 `/32` 和 IPv6 `/128` 处理。相同前缀或域名范围指定不同动作时会报冲突。
+- `a.com` 精确匹配根域名，`*.a.com` 匹配任意深度的子域名。域名按 DNS 标签边界匹配，书写时可使用大写、根点和 IDNA 域名。
+- 先匹配最具体的域名，再尝试已有的目标地址。IP 阶段依次使用非 `/0` 的最长 CIDR、`PrivateIP`、对应 IP 家族的 `/0`。最后使用必填的全局 `*`。编译器不会添加 DNS 解析步骤，只有域名且域名未命中的请求使用 `*`。
+- `RuleSet, PrivateIP, Direct` 直接使用 sing-box 的 `ip_is_private`，继承运行版本对非公网地址的定义。
 
-可能会编写 action 维护一些其他的规则集。
+## 规则集
+
+用户定义的规则集名称匹配 `[A-Za-z0-9._~-]+`，区分大小写。 `file(...)` 的相对路径以 DSL 源文件所在目录为基准。 `url(...)` 在编译时下载源文件。
+
+支持 sing-box JSON 规则集版本 1 至 5，以及可由本地 sing-box 反编译的 SRS 版本 2 至 5。使用 `--sing-box /path/to/sing-box` 可指定反编译程序。规则集中的目标域名、域名后缀、IP 和由这些条件构成的逻辑 OR 可以展开。其他条件、逻辑 AND、取反和有旧版后缀语义的 SRS 版本 1 会报错。导入项和手写规则共享优先级，输出使用内联条件。
+
+## 测试
+
+```sh
+cargo test --locked
+SING_BOX=/path/to/sing-box cargo test --locked
+SING_BOX_RUNTIME=/path/to/sing-box cargo test --locked verifies_real_routing -- --ignored
+```
+
+`SING_BOX` 启用真实二进制的配置检查、匹配和 SRS 测试。 `SING_BOX_RUNTIME` 启用需要启动 sing-box 并监听本地端口的 SOCKS 连接测试。

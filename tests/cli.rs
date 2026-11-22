@@ -116,7 +116,13 @@ fn merges_unrelated_prefixes_across_lengths_and_is_order_independent() {
     let shuffled = project.compile("", &rows.into_iter().rev().collect::<Vec<_>>().join("\n"));
     assert_eq!(initial, shuffled);
     let rules = initial["route"]["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 3);
+    let pivot = rules
+        .iter()
+        .position(|rule| rule["action"] == "resolve")
+        .unwrap();
+    assert_eq!(pivot, 4); // Three first-pass matchers and the known-IP fallback.
+    assert_eq!(rules[3]["outbound"], "Proxy");
+    assert_eq!(rules[3]["ip_cidr"], json!(["0.0.0.0/0", "::/0"]));
     assert_eq!(rules[0]["outbound"], "Direct");
     assert_eq!(rules[1]["action"], "reject");
     assert_eq!(rules[1]["ip_cidr"].as_array().unwrap().len(), 4);
@@ -255,7 +261,7 @@ fn output_match(config: &Value, host: Option<&str>, ip: Option<std::net::IpAddr>
         .as_array()
         .unwrap()
         .iter()
-        .find(|rule| matches_output(rule, host, ip));
+        .find(|rule| rule["action"] != "resolve" && matches_output(rule, host, ip));
     match matched {
         Some(rule) if rule["action"] == "reject" => "REJECT",
         Some(rule) => rule["outbound"].as_str().unwrap(),
@@ -265,12 +271,16 @@ fn output_match(config: &Value, host: Option<&str>, ip: Option<std::net::IpAddr>
 }
 
 fn matches_output(rule: &Value, host: Option<&str>, ip: Option<std::net::IpAddr>) -> bool {
+    matches_output_ips(rule, host, ip.as_slice())
+}
+
+fn matches_output_ips(rule: &Value, host: Option<&str>, ips: &[std::net::IpAddr]) -> bool {
     let matched = if rule["type"] == "logical" {
         let mut children = rule["rules"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|child| matches_output(child, host, ip));
+            .map(|child| matches_output_ips(child, host, ips));
         if rule["mode"] == "and" {
             children.all(|result| result)
         } else {
@@ -293,9 +303,9 @@ fn matches_output(rule: &Value, host: Option<&str>, ip: Option<std::net::IpAddr>
                             }
                     })
             })
-            || ip.is_some_and(|ip| {
-                field_items(rule, "ip_cidr")
-                    .any(|net| net.parse::<ipnet::IpNet>().unwrap().contains(&ip))
+            || field_items(rule, "ip_cidr").any(|net| {
+                let net = net.parse::<ipnet::IpNet>().unwrap();
+                ips.iter().any(|ip| net.contains(ip))
             })
     };
     matched ^ (rule["invert"] == true)
@@ -510,7 +520,7 @@ fn verifies_generated_conditions_with_real_sing_box() {
         let fields = condition.as_object_mut().unwrap();
         fields.remove("action");
         fields.remove("outbound");
-        if fields.contains_key("ip_is_private") {
+        if fields.is_empty() || fields.contains_key("ip_is_private") {
             // ip_is_private is a route-only field.
             continue;
         }
@@ -599,5 +609,140 @@ fn downloads_and_expands_a_url_ruleset() {
     assert_eq!(
         output_match(&config, None, Some("203.0.113.4".parse().unwrap())),
         "Aliyun"
+    );
+}
+
+#[test]
+fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
+    let project = Project::new();
+    let config = project.compile(
+        "",
+        "
+        a.com, REJECT
+        203.0.113.0/24, Direct
+        192.0.2.0/24, REJECT
+        2001:db8::/32, Aliyun
+        *, Proxy
+    ",
+    );
+    let rules = config["route"]["rules"].as_array().unwrap();
+    let pivot = rules
+        .iter()
+        .position(|rule| rule["action"] == "resolve")
+        .expect("DNS fallback");
+    assert!(
+        rules[..pivot]
+            .iter()
+            .any(|rule| rule["action"] == "reject" && rule.get("domain").is_some())
+    );
+    assert!(
+        rules[pivot + 1..]
+            .iter()
+            .all(|rule| rule.get("domain").is_none() && rule.get("domain_suffix").is_none())
+    );
+
+    let expected_routes = [
+        (Some("a.com"), None, &[][..], ("REJECT", false)),
+        (
+            Some("a.com"),
+            Some("203.0.113.4"),
+            &[][..],
+            ("REJECT", false),
+        ),
+        (
+            Some("b.com"),
+            Some("203.0.113.4"),
+            &[][..],
+            ("Direct", false),
+        ),
+        (
+            Some("b.com"),
+            Some("198.51.100.8"),
+            &["192.0.2.1"][..],
+            ("Proxy", false),
+        ),
+        (None, Some("198.51.100.8"), &[][..], ("Proxy", false)),
+        (Some("b.com"), None, &["203.0.113.4"][..], ("Direct", true)),
+        (Some("b.com"), None, &["192.0.2.9"][..], ("REJECT", true)),
+        (Some("b.com"), None, &["198.51.100.8"][..], ("Proxy", true)),
+        (
+            Some("b.com"),
+            None,
+            &["192.0.2.9", "2001:db8::1"][..],
+            ("Aliyun", true),
+        ),
+        (
+            Some("b.com"),
+            None,
+            &["203.0.113.4", "192.0.2.9"][..],
+            ("REJECT", true),
+        ),
+    ];
+    for (host, ip, answers, (action, resolved)) in expected_routes {
+        assert_eq!(
+            route_with_dns(&config, host, ip, answers),
+            (action.to_string(), resolved),
+            "{host:?} {ip:?} {answers:?}"
+        );
+    }
+}
+
+#[test]
+fn resolves_against_all_address_families_without_masking_ipv6() {
+    let project = Project::new();
+    let config = project.compile("", "10.0.0.0/8, Direct\n::/80, REJECT\n*, Proxy");
+    assert_eq!(
+        route_with_dns(&config, Some("b.com"), None, &["::1", "::ffff:10.0.0.1"]),
+        ("REJECT".into(), true)
+    );
+    assert_eq!(
+        route_with_dns(&config, Some("b.com"), None, &["::ffff:10.0.0.1"]),
+        ("Direct".into(), true)
+    );
+}
+
+fn route_with_dns(
+    config: &Value,
+    host: Option<&str>,
+    ip: Option<&str>,
+    answers: &[&str],
+) -> (String, bool) {
+    let route = &config["route"];
+    let mut matched_ips: Vec<_> = ip.map(|ip| ip.parse().unwrap()).into_iter().collect();
+    let mut resolved = false;
+    for rule in route["rules"].as_array().unwrap() {
+        if !matches_output_ips(rule, host, &matched_ips) {
+            continue;
+        }
+        match rule["action"].as_str().unwrap() {
+            "resolve" => {
+                assert!(matched_ips.is_empty());
+                resolved = true;
+                matched_ips = answers
+                    .iter()
+                    .map(|answer| answer.parse().unwrap())
+                    .collect();
+            }
+            "reject" => return ("REJECT".into(), resolved),
+            "route" => return (rule["outbound"].as_str().unwrap().into(), resolved),
+            action => panic!("{action}"),
+        }
+    }
+    (route["final"].as_str().unwrap().into(), resolved)
+}
+
+#[test]
+fn omits_dns_when_ip_rules_cannot_change_the_fallback() {
+    let project = Project::new();
+    let config = project.compile(
+        "",
+        "a.com, REJECT\n203.0.113.0/24, Proxy\nRuleSet, PrivateIP, Proxy\n*, Proxy",
+    );
+    let rules = config["route"]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["action"], "reject");
+    assert_eq!(
+        route_with_dns(&config, Some("b.com"), None, &["203.0.113.4"]),
+        ("Proxy".into(), false)
     );
 }

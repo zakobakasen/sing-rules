@@ -1,8 +1,12 @@
 use crate::model::{self, Matcher, REJECT, Table};
 use anyhow::{Context, Result, ensure};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv6Net};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv6Addr,
+};
 
 struct Node<'a> {
     matcher: &'a Matcher,
@@ -11,7 +15,7 @@ struct Node<'a> {
     pending_children: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Layer<'a> {
     action: &'a str,
     matchers: Vec<&'a Matcher>,
@@ -46,34 +50,35 @@ pub fn compile(table: &Table, mut base: Value, replace_route: bool) -> Result<Va
         );
     }
 
-    let mut layers = domain_layers(table);
-    for layer in ip_layers(table) {
-        push_layer(&mut layers, layer);
-    }
-    if let Some(rule) = table.rules.get(&Matcher::PrivateIp) {
-        push_layer(
-            &mut layers,
-            Layer {
-                action: &rule.target,
-                matchers: vec![&Matcher::PrivateIp],
-            },
-        );
-    }
-
     let fallback = &table.rules[&Matcher::Any].target;
-    for (matcher, rule) in &table.rules {
-        if matches!(matcher, Matcher::Ip(net) if net.prefix_len() == 0) && rule.target != *fallback
+    let needs_dns = table.rules.iter().any(|(matcher, rule)| {
+        matches!(matcher, Matcher::Ip(_) | Matcher::PrivateIp) && rule.target != *fallback
+    });
+    let mut layers = domain_layers(table);
+    let mut trailing_ip_layers = Vec::new();
+    if needs_dns {
+        trailing_ip_layers = trailing_ip_layers_for_table(table, fallback);
+        for layer in ip_layers(table)
+            .into_iter()
+            .chain(trailing_ip_layers.iter().cloned())
         {
-            push_layer(
-                &mut layers,
-                Layer {
-                    action: &rule.target,
-                    matchers: vec![matcher],
-                },
-            );
+            push_layer(&mut layers, layer);
         }
     }
-    let mut rules: Vec<_> = layers.into_iter().map(emit).collect();
+    let mut rules: Vec<_> = layers.into_iter().map(|layer| emit(layer, false)).collect();
+    if needs_dns {
+        // Every existing IP has decided its route before an unmatched domain reaches resolve.
+        let mut known_ip_fallback = json!({"ip_cidr": ["0.0.0.0/0", "::/0"]});
+        set_action(known_ip_fallback.as_object_mut().unwrap(), fallback);
+        rules.push(known_ip_fallback);
+        rules.push(json!({"action": "resolve"}));
+
+        let mut resolved_layers = resolved_ip_layers(table);
+        for layer in trailing_ip_layers {
+            push_layer(&mut resolved_layers, layer);
+        }
+        rules.extend(resolved_layers.into_iter().map(|layer| emit(layer, true)));
+    }
     if fallback == REJECT {
         if let Some(last) = rules.last_mut().filter(|last| last["action"] == "reject") {
             *last = json!({"action": "reject"});
@@ -86,6 +91,66 @@ pub fn compile(table: &Table, mut base: Value, replace_route: bool) -> Result<Va
     }
     route.insert("rules".into(), json!(rules));
     Ok(base)
+}
+
+fn trailing_ip_layers_for_table<'a>(table: &'a Table, fallback: &str) -> Vec<Layer<'a>> {
+    let mut layers = Vec::new();
+    if let Some(rule) = table.rules.get(&Matcher::PrivateIp) {
+        layers.push(Layer {
+            action: &rule.target,
+            matchers: vec![&Matcher::PrivateIp],
+        });
+    }
+
+    let defaults: Vec<_> = table
+        .rules
+        .iter()
+        .filter(|(matcher, _)| matches!(matcher, Matcher::Ip(net) if net.prefix_len() == 0))
+        .collect();
+    if defaults.iter().any(|(_, rule)| rule.target != fallback) {
+        // V4 comes first if the DNS answer set contains both families.
+        for (matcher, rule) in defaults {
+            push_layer(
+                &mut layers,
+                Layer {
+                    action: &rule.target,
+                    matchers: vec![matcher],
+                },
+            );
+        }
+    }
+    layers
+}
+
+fn resolved_ip_layers(table: &Table) -> Vec<Layer<'_>> {
+    // sing-box matches any DNS answer. A shorter prefix must not win merely
+    // because its prefix is disjoint from a longer rule on another answer.
+    let mut candidates: Vec<_> = table
+        .rules
+        .iter()
+        .filter_map(|(matcher, rule)| match matcher {
+            Matcher::Ip(net) if net.prefix_len() > 0 => Some((
+                Reverse(net.prefix_len()),
+                rule.target != REJECT,
+                rule.target.as_str(),
+                matcher,
+            )),
+            _ => None,
+        })
+        .collect();
+    candidates.sort_unstable();
+
+    let mut layers = Vec::new();
+    for (_, _, action, matcher) in candidates {
+        push_layer(
+            &mut layers,
+            Layer {
+                action,
+                matchers: vec![matcher],
+            },
+        );
+    }
+    layers
 }
 
 fn domain_layers(table: &Table) -> Vec<Layer<'_>> {
@@ -221,7 +286,7 @@ fn push_layer<'a>(layers: &mut Vec<Layer<'a>>, layer: Layer<'a>) {
     }
 }
 
-fn emit(layer: Layer<'_>) -> Value {
+fn emit(layer: Layer<'_>, multiple_addresses: bool) -> Value {
     let mut ip = Vec::new();
     let mut ipv6_excluding_mapped = Vec::new();
     let mut exact = BTreeSet::new();
@@ -234,7 +299,11 @@ fn emit(layer: Layer<'_>) -> Value {
                 ip.push(model::ipv4_alias(*net));
             }
             Matcher::Ip(net) if net.contains(&model::mapped_network()) => {
-                ipv6_excluding_mapped.push(*net)
+                if multiple_addresses {
+                    ip.extend(exclude_mapped_subnet(net.prefix_len()));
+                } else {
+                    ipv6_excluding_mapped.push(*net);
+                }
             }
             Matcher::Ip(net) => ip.push(*net),
             Matcher::Exact(name) => {
@@ -277,14 +346,32 @@ fn emit(layer: Layer<'_>) -> Value {
         };
         rule = combined.as_object().unwrap().clone();
     }
-    let action = if layer.action == REJECT {
+    set_action(&mut rule, layer.action);
+    Value::Object(rule)
+}
+
+fn set_action(rule: &mut Map<String, Value>, target: &str) {
+    let action = if target == REJECT {
         "reject"
     } else {
-        rule.insert("outbound".into(), json!(layer.action));
+        rule.insert("outbound".into(), json!(target));
         "route"
     };
     rule.insert("action".into(), json!(action));
-    Value::Object(rule)
+}
+
+fn exclude_mapped_subnet(covering_bits: u8) -> impl Iterator<Item = IpNet> {
+    // Negating a mapped CIDR would reject the whole answer set if any
+    // address were mapped. Use the siblings of the mapped prefix instead.
+    let mapped = model::mapped_network();
+    let address = match mapped.addr() {
+        std::net::IpAddr::V6(address) => u128::from(address),
+        _ => unreachable!(),
+    };
+    (covering_bits + 1..=mapped.prefix_len()).map(move |bits| {
+        let sibling = Ipv6Addr::from(address ^ (1 << (128 - bits)));
+        IpNet::V6(Ipv6Net::new(sibling, bits).unwrap().trunc())
+    })
 }
 
 fn cidrs(networks: Vec<IpNet>) -> Value {

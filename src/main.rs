@@ -38,6 +38,12 @@ enum Commands {
         sing_box: PathBuf,
         #[arg(long, help = "Replace any existing base route.rules")]
         replace_route: bool,
+        #[arg(
+            long,
+            conflicts_with = "replace_route",
+            help = "Run existing base route.rules before generated rules"
+        )]
+        base_rules_first: bool,
         #[arg(long, help = "Directory for downloaded rule sets")]
         cache_dir: Option<PathBuf>,
         #[arg(long, help = "Download rule sets again even if cached")]
@@ -52,6 +58,7 @@ fn main() -> Result<()> {
         output,
         sing_box,
         replace_route,
+        base_rules_first,
         cache_dir,
         refresh,
     } = Cli::parse().command;
@@ -62,7 +69,14 @@ fn main() -> Result<()> {
     let base_bytes = fs::read(&base).with_context(|| format!("reading {}", base.display()))?;
     let base_config = serde_json::from_slice(&base_bytes)
         .with_context(|| format!("parsing {}", base.display()))?;
-    let config = compiler::compile(&table, base_config, replace_route)?;
+    let base_rules = if base_rules_first {
+        compiler::BaseRules::First
+    } else if replace_route {
+        compiler::BaseRules::Replace
+    } else {
+        compiler::BaseRules::RequireEmpty
+    };
+    let config = compiler::compile(&table, base_config, base_rules)?;
     if let Some(output) = output {
         let parent = output
             .parent()

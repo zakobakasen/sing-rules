@@ -21,7 +21,13 @@ struct Layer<'a> {
     matchers: Vec<&'a Matcher>,
 }
 
-pub fn compile(table: &Table, mut base: Value, replace_route: bool) -> Result<Value> {
+pub enum BaseRules {
+    RequireEmpty,
+    Replace,
+    First,
+}
+
+pub fn compile(table: &Table, mut base: Value, base_rules: BaseRules) -> Result<Value> {
     let root = base
         .as_object_mut()
         .context("base configuration must be an object")?;
@@ -43,12 +49,24 @@ pub fn compile(table: &Table, mut base: Value, replace_route: bool) -> Result<Va
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("base route must be an object")?;
-    if let Some(existing) = route.get("rules") {
-        ensure!(
-            replace_route || existing.as_array().is_some_and(Vec::is_empty),
-            "base route.rules is populated; pass --replace-route to replace it explicitly"
-        );
-    }
+    let existing = route.remove("rules");
+    let prefix = match base_rules {
+        BaseRules::RequireEmpty => {
+            ensure!(
+                existing
+                    .as_ref()
+                    .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty)),
+                "base route.rules is populated; pass --base-rules-first to preserve it or --replace-route to replace it"
+            );
+            Vec::new()
+        }
+        BaseRules::Replace => Vec::new(),
+        BaseRules::First => match existing {
+            Some(Value::Array(rules)) => rules,
+            None => Vec::new(),
+            Some(_) => anyhow::bail!("base route.rules must be an array"),
+        },
+    };
 
     let fallback = &table.rules[&Matcher::Any].target;
     let needs_dns = table.rules.iter().any(|(matcher, rule)| {
@@ -89,7 +107,9 @@ pub fn compile(table: &Table, mut base: Value, replace_route: bool) -> Result<Va
     } else {
         route.insert("final".into(), json!(fallback));
     }
-    route.insert("rules".into(), json!(rules));
+    let mut combined = prefix;
+    combined.append(&mut rules);
+    route.insert("rules".into(), Value::Array(combined));
     Ok(base)
 }
 

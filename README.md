@@ -31,7 +31,19 @@ cargo run --locked -- compile routes.rules --base sing-box.json -o compiled.json
 sing-box check -c compiled.json
 ```
 
-基础配置提供入站、出站和 DNS 等配置。 `outbound` 块声明表可以引用的出站标签，名称与基础配置的 `tag` 一致。 `REJECT` 是内置动作。省略 `-o` 时输出到标准输出。基础配置已有路由规则时，用 `--replace-route` 明确替换整组 `route.rules`。DSL 管理 `route.rules` 和 `route.final`，基础配置中其他字段会保留。
+基础配置提供入站、出站和 DNS 等配置。 `outbound` 块声明表可以引用的出站标签，名称与基础配置的 `tag` 一致。 `REJECT` 是内置动作。省略 `-o` 时输出到标准输出。基础配置已有 `route.rules` 时，使用 `--base-rules-first` 将它们按原顺序放在生成规则之前，或使用 `--replace-route` 替换它们。两项互斥。 `route.final` 由 DSL 的全局兜底决定，其他基础配置字段会保留。
+
+例如，要先将 53 端口的请求交给 sing-box 的 DNS 模块，在基础配置中写入以下原生规则，并在编译时加 `--base-rules-first`。
+
+```json
+{
+  "route": {
+    "rules": [
+      { "port": [53], "action": "hijack-dns" }
+    ]
+  }
+}
+```
 
 ## 语法和优先级
 

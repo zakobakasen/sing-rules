@@ -939,3 +939,62 @@ fn reports_both_ruleset_actions_and_the_tied_priority() {
         "expected",
     );
 }
+
+#[test]
+fn base_rules_run_before_generated_rules_when_requested() {
+    let project = Project::new();
+    let base_path = project.0.path().join("base.json");
+    let compiled_path = project.0.path().join("compiled.json");
+    let mut base: Value = serde_json::from_slice(&fs::read(&base_path).unwrap()).unwrap();
+    let native = json!([
+        {"port": [53], "action": "hijack-dns"},
+        {"action": "sniff"}
+    ]);
+    base["route"] = json!({"rules": native, "final": "Aliyun", "auto_detect_interface": true});
+    project.write("base.json", &base.to_string());
+    let table = "blocked.example, REJECT\n203.0.113.0/24, Direct\n*, Proxy";
+
+    project.error("", table, "--base-rules-first");
+    assert!(
+        !project
+            .run_with("", table, &["--base-rules-first", "--replace-route"])
+            .status
+            .success()
+    );
+
+    let result = project.run_with("", table, &["--base-rules-first"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preserved: Value = serde_json::from_slice(&fs::read(&compiled_path).unwrap()).unwrap();
+    let preserved_rules = preserved["route"]["rules"].as_array().unwrap();
+    assert_eq!(&preserved_rules[..2], native.as_array().unwrap());
+    assert_eq!(preserved["route"]["final"], "Proxy");
+    assert_eq!(preserved["route"]["auto_detect_interface"], true);
+    if let Some(binary) = std::env::var_os("SING_BOX") {
+        let checked = Command::new(binary)
+            .current_dir(project.0.path())
+            .args(["check", "-c", "compiled.json"])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    let result = project.run_with("", table, &["--replace-route"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let replaced: Value = serde_json::from_slice(&fs::read(&compiled_path).unwrap()).unwrap();
+    assert_eq!(
+        preserved_rules[2..],
+        replaced["route"]["rules"].as_array().unwrap()[..]
+    );
+}

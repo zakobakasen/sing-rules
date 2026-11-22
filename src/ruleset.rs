@@ -144,22 +144,29 @@ fn expand(rule: &Value, at: &str, output: &mut Vec<(Matcher, String)>) -> Result
     let object = rule
         .as_object()
         .with_context(|| format!("{at}: expected a headless rule"))?;
-    ensure!(
-        object.get("invert").is_none_or(|invert| invert == false),
-        "{at}: unsupported invert"
-    );
+    if let Some(invert) = object.get("invert") {
+        let invert = invert
+            .as_bool()
+            .with_context(|| format!("{at}: expected a boolean invert"))?;
+        if invert {
+            eprintln!("warning: {at}: skipping rule with unsupported invert");
+            return Ok(());
+        }
+    }
     match object.get("type") {
         Some(kind) if kind == "logical" => {
-            for field in object.keys() {
-                ensure!(
-                    matches!(field.as_str(), "type" | "mode" | "rules" | "invert"),
-                    "{at}: unsupported field {field}"
-                );
+            let mode = rule["mode"]
+                .as_str()
+                .with_context(|| format!("{at}: expected a logical mode"))?;
+            if mode != "or" {
+                eprintln!("warning: {at}: skipping unsupported logical mode {mode:?}");
+                return Ok(());
             }
-            ensure!(
-                rule["mode"] == "or",
-                "{at}: only logical OR rules can be expanded"
-            );
+            for field in object.keys() {
+                if !matches!(field.as_str(), "type" | "mode" | "rules" | "invert") {
+                    warn_unsupported_field(at, field);
+                }
+            }
             let children = rule["rules"]
                 .as_array()
                 .filter(|children| !children.is_empty())
@@ -169,10 +176,13 @@ fn expand(rule: &Value, at: &str, output: &mut Vec<(Matcher, String)>) -> Result
             }
             return Ok(());
         }
-        Some(kind) if kind != "default" => bail!("{at}: unsupported rule type {kind}"),
+        Some(kind) if kind != "default" => {
+            ensure!(kind.is_string(), "{at}: expected a string rule type");
+            eprintln!("warning: {at}: skipping unsupported rule type {kind}");
+            return Ok(());
+        }
         _ => {}
     }
-    let previous = output.len();
     for (field, value) in object {
         let parse: fn(&str) -> Result<Matcher> = match field.as_str() {
             "type" | "invert" => continue,
@@ -185,7 +195,10 @@ fn expand(rule: &Value, at: &str, output: &mut Vec<(Matcher, String)>) -> Result
                     subdomains_only: name.is_some(),
                 })
             },
-            _ => bail!("{at}: unsupported field {field}"),
+            _ => {
+                warn_unsupported_field(at, field);
+                continue;
+            }
         };
         let items = match value {
             Value::Array(items) => items.as_slice(),
@@ -201,6 +214,9 @@ fn expand(rule: &Value, at: &str, output: &mut Vec<(Matcher, String)>) -> Result
             output.push((matcher, source));
         }
     }
-    ensure!(output.len() > previous, "{at}: empty headless rule");
     Ok(())
+}
+
+fn warn_unsupported_field(source: &str, field: &str) {
+    eprintln!("warning: {source}: ignoring unsupported field {field}");
 }

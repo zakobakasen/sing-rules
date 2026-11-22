@@ -152,14 +152,71 @@ fn validates_names_references_and_normalized_conflicts() {
     );
     project.error("", "IP, [1.1.1.1, 1.0.0.1], Proxy\n*, Direct", "expected");
     project.error("", "1.1.1.1, Proxy", "fallback");
+}
+
+#[test]
+fn warns_and_keeps_supported_ruleset_fields() {
+    let project = Project::new();
+    project.write("ads.json", r#"{"version":4,"rules":[
+        {"domain_regex":["^only-regex"],"domain":["ads.example"],"domain_suffix":["tracker.example"],"ip_cidr":["203.0.113.0/24"]},
+        {"domain_keyword":["keyword"]},
+        {"port":[80],"domain":["port-qualified.example"]},
+        {"type":"logical","mode":"and","rules":[{"domain":["ignored.example"]},{"port":[80]}]},
+        {"invert":true,"domain":["negated.example"]},
+        {"type":"logical","mode":"or","rules":[{"domain_keyword":["keyword"]},{"domain":"or.example"}]}
+    ]}"#);
+    let output = project.run(
+        r#"ruleset ads = file("ads.json")"#,
+        "RuleSet, ads, REJECT\n*, Proxy",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for part in [
+        "warning:",
+        "ads.json:rules[0]",
+        "domain_regex",
+        "domain_keyword",
+        "port",
+        "and",
+        "invert",
+    ] {
+        assert!(stderr.contains(part), "missing {part}: {stderr}");
+    }
+    let config =
+        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    for host in [
+        "ads.example",
+        "x.tracker.example",
+        "port-qualified.example",
+        "or.example",
+    ] {
+        assert_eq!(output_match(&config, Some(host), None), "REJECT", "{host}");
+    }
+    for host in [
+        "only-regex.example",
+        "keyword.example",
+        "ignored.example",
+        "negated.example",
+    ] {
+        assert_eq!(output_match(&config, Some(host), None), "Proxy", "{host}");
+    }
+    assert_eq!(
+        output_match(&config, None, Some("203.0.113.4".parse().unwrap())),
+        "REJECT"
+    );
+}
+
+#[test]
+fn still_rejects_malformed_supported_ruleset_fields() {
+    let project = Project::new();
     project.write(
-        "cn.json",
-        r#"{"version":4,"rules":[{"ip_cidr":["10.0.0.0/8"],"port":[80]}]}"#,
+        "ads.json",
+        r#"{"version":4,"rules":[{"domain_regex":["x"],"ip_cidr":["bad-ip"]}]}"#,
     );
     project.error(
-        r#"ruleset cn = file("cn.json")"#,
-        "RuleSet, cn, Proxy\n*, Direct",
-        "port",
+        r#"ruleset ads = file("ads.json")"#,
+        "RuleSet, ads, REJECT\n*, Proxy",
+        "rules[0].ip_cidr[0]",
     );
 }
 

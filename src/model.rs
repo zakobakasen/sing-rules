@@ -1,7 +1,8 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ipnet::IpNet;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     net::{IpAddr, Ipv4Addr},
 };
 
@@ -20,29 +21,76 @@ pub enum Matcher {
 pub struct Rule {
     pub target: String,
     pub source: String,
+    pub ruleset: Option<String>,
+    pub priority: i32,
+}
+
+impl Rule {
+    fn describe(&self) -> String {
+        let label = self
+            .ruleset
+            .as_deref()
+            .map_or_else(|| "table rule".into(), |name| format!("RuleSet {name}"));
+        format!(
+            "{label} -> {} (priority={}) at {}",
+            self.target, self.priority, self.source
+        )
+    }
 }
 
 #[derive(Default)]
 pub struct Table {
     pub outbounds: BTreeSet<String>,
     pub rules: BTreeMap<Matcher, Rule>,
+    conflicts: BTreeMap<Matcher, Rule>,
 }
 
 impl Table {
-    pub fn add(&mut self, matcher: Matcher, target: &str, source: String) -> Result<()> {
-        if let Some(previous) = self.rules.get(&matcher) {
-            ensure!(
-                previous.target == target,
-                "{source}: conflicting rule for {matcher:?}; previous rule at {}",
-                previous.source
-            );
-        } else {
-            self.rules.insert(
-                matcher,
-                Rule {
-                    target: target.into(),
-                    source,
-                },
+    pub fn add(&mut self, matcher: Matcher, rule: Rule) {
+        match self.rules.entry(matcher) {
+            Entry::Vacant(entry) => {
+                entry.insert(rule);
+            }
+            Entry::Occupied(mut entry) => match rule.priority.cmp(&entry.get().priority) {
+                Ordering::Greater => {
+                    self.conflicts.remove(entry.key());
+                    entry.insert(rule);
+                }
+                Ordering::Equal if rule.target != entry.get().target => {
+                    self.conflicts.entry(entry.key().clone()).or_insert(rule);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    pub fn check_conflicts(&self) -> Result<()> {
+        // Check after all rules are loaded. A later higher priority can resolve a tie.
+        if let Some((matcher, second)) = self.conflicts.first_key_value() {
+            let first = &self.rules[matcher];
+            let scope = match matcher {
+                Matcher::Ip(net) => format!("IP prefix {net}"),
+                Matcher::Exact(name) => format!("exact domain {name}"),
+                Matcher::Suffix {
+                    name,
+                    subdomains_only: true,
+                } => format!("subdomains of {name}"),
+                Matcher::Suffix {
+                    name,
+                    subdomains_only: false,
+                } => format!("domain suffix {name} (including subdomains)"),
+                Matcher::PrivateIp => "PrivateIP".into(),
+                Matcher::Any => "global fallback (*)".into(),
+            };
+            let help = if first.ruleset.is_some() || second.ruleset.is_some() {
+                "\n  help: set priority=... on the RuleSet reference that should win"
+            } else {
+                ""
+            };
+            bail!(
+                "conflicting rules for {scope}\n  {}\n  {}{help}",
+                first.describe(),
+                second.describe()
             );
         }
         Ok(())

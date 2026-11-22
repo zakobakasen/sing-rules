@@ -853,3 +853,89 @@ fn omits_dns_when_ip_rules_cannot_change_the_fallback() {
         ("Proxy".into(), false)
     );
 }
+
+#[test]
+fn ruleset_priority_breaks_ties_without_overriding_more_specific_rules() {
+    let project = Project::new();
+    project.write(
+        "ads.json",
+        r#"{"version":5,"rules":[{"domain_suffix":"byteadverts.com","ip_cidr":"10.0.0.0/8"}]}"#,
+    );
+    project.write("cn.json", r#"{"version":5,"rules":[{"domain_suffix":"byteadverts.com","domain":"api.byteadverts.com","ip_cidr":["10.0.0.0/8","10.2.0.0/16"]}]}"#);
+    let imports = "ruleset ads = file(\"ads.json\")\nruleset cn = file(\"cn.json\")";
+    let ads = "RuleSet, ads, REJECT, priority=100";
+    let cn = "RuleSet, cn, Direct";
+    let another_cn = "RuleSet, cn, Aliyun, priority=-1";
+    let output = project.compile(imports, &format!("{cn}\n{ads}\n{another_cn}\n*, Proxy"));
+    assert_eq!(
+        output,
+        project.compile(imports, &format!("{ads}\n{another_cn}\n{cn}\n*, Proxy"))
+    );
+    assert_eq!(
+        output_match(&output, Some("byteadverts.com"), None),
+        "REJECT"
+    );
+    assert_eq!(
+        output_match(&output, Some("x.byteadverts.com"), None),
+        "REJECT"
+    );
+    assert_eq!(
+        output_match(&output, Some("api.byteadverts.com"), None),
+        "Direct"
+    );
+    assert_eq!(
+        output_match(&output, None, Some("10.1.0.1".parse().unwrap())),
+        "REJECT"
+    );
+    assert_eq!(
+        output_match(&output, None, Some("10.2.0.1".parse().unwrap())),
+        "Direct"
+    );
+}
+
+#[test]
+fn reports_both_ruleset_actions_and_the_tied_priority() {
+    let project = Project::new();
+    let source = r#"{"version":5,"rules":[{"domain_suffix":"byteadverts.com"}]}"#;
+    project.write("ads.json", source);
+    project.write("cn.json", source);
+    let imports = "ruleset ads = file(\"ads.json\")\nruleset cn = file(\"cn.json\")";
+    let result = project.run(
+        imports,
+        "RuleSet, ads, REJECT\nRuleSet, cn, Direct, priority=0\n*, Proxy",
+    );
+    assert!(!result.status.success());
+    let report = String::from_utf8_lossy(&result.stderr);
+    for expected in [
+        "conflict",
+        "byteadverts.com",
+        "including subdomains",
+        "RuleSet ads",
+        "RuleSet cn",
+        "REJECT",
+        "Direct",
+        "priority=0",
+        "ads.json:rules[0]",
+        "cn.json:rules[0]",
+    ] {
+        assert!(report.contains(expected), "missing {expected:?}: {report}");
+    }
+    let higher = project.compile(
+        imports,
+        "RuleSet, cn, Direct\nRuleSet, ads, REJECT\nRuleSet, cn, Aliyun, priority=5\n*, Proxy",
+    );
+    assert_eq!(
+        output_match(&higher, Some("byteadverts.com"), None),
+        "Aliyun"
+    );
+    project.error(
+        imports,
+        "RuleSet, ads, REJECT, priority=high\n*, Proxy",
+        "priority",
+    );
+    project.error(
+        "",
+        "Domain, example.com, Proxy, priority=1\n*, Proxy",
+        "expected",
+    );
+}

@@ -1,6 +1,6 @@
 use crate::{
     cache::Cache,
-    model::{self, Matcher, PRIVATE_IP, REJECT, Table},
+    model::{self, Matcher, PRIVATE_IP, REJECT, Rule, Table},
     ruleset::{self, Source},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -81,10 +81,15 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
     for (line, at) in rows {
         let result = (|| -> Result<()> {
             let fields: Vec<_> = split(line, ',').map(str::trim).collect();
-            let (kind, content, target) = match fields.as_slice() {
-                [content, target] => (None, *content, *target),
-                [kind, content, target] => (Some(*kind), *content, *target),
-                _ => bail!("expected [type,] match, outbound"),
+            let (kind, content, target, priority) = match fields.as_slice() {
+                [content, target] => (None, *content, *target, 0),
+                [kind, content, target] => (Some(*kind), *content, *target, 0),
+                ["RuleSet", content, target, option] => {
+                    (Some("RuleSet"), *content, *target, parse_priority(option)?)
+                }
+                _ => {
+                    bail!("expected [type,] match, outbound or RuleSet, name, outbound, priority=N")
+                }
             };
             let target = tag(target)?;
             ensure!(
@@ -92,10 +97,17 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                 "undeclared outbound {target:?}"
             );
 
+            let rule = |source| Rule {
+                target: target.clone(),
+                source,
+                ruleset: (kind == Some("RuleSet")).then(|| content.to_owned()),
+                priority,
+            };
             if kind == Some("RuleSet") {
                 validate_name(content)?;
                 if content == PRIVATE_IP {
-                    return table.add(Matcher::PrivateIp, &target, at.clone());
+                    table.add(Matcher::PrivateIp, rule(at.clone()));
+                    return Ok(());
                 }
                 let source = sources
                     .get(content)
@@ -104,11 +116,12 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                     imported.insert(source, ruleset::load(source, directory, sing_box, cache)?);
                 }
                 for (matcher, origin) in &imported[source] {
-                    table.add(matcher.clone(), &target, format!("{at} ({origin})"))?;
+                    table.add(matcher.clone(), rule(format!("{at} ({origin})")));
                 }
-                return Ok(());
+            } else {
+                table.add(parse_matcher(kind, content)?, rule(at.clone()));
             }
-            table.add(parse_matcher(kind, content)?, &target, at.clone())
+            Ok(())
         })();
         result.with_context(|| at)?;
     }
@@ -118,7 +131,17 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
         "{}: missing global fallback (*, outbound)",
         path.display()
     );
+    table.check_conflicts()?;
     Ok(table)
+}
+
+fn parse_priority(option: &str) -> Result<i32> {
+    let (key, value) = option.split_once('=').context("expected priority=N")?;
+    ensure!(key.trim() == "priority", "expected priority=N");
+    value
+        .trim()
+        .parse()
+        .context("priority must be a signed 32-bit integer")
 }
 
 fn validate_name(name: &str) -> Result<()> {

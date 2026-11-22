@@ -1578,3 +1578,29 @@ fn ordinary_rules_accept_priority_with_or_without_a_type() {
         "conflict",
     );
 }
+
+#[test]
+fn generated_tags_keep_their_prefix_and_only_extend_on_collision() {
+    let project = Project::new();
+    let original = project.compile("", "a.example, Direct\n*, Proxy");
+    let stem = original["route"]["rule_set"][0]["tag"].as_str().unwrap();
+    assert_eq!(stem.len(), 1);
+    assert!(stem.bytes().all(|c| c.is_ascii_alphanumeric()));
+    let mut base: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("base.json")).unwrap()).unwrap();
+    base["route"] = json!({"rule_set":[{"type":"inline","tag":stem,"rules":[{"domain":["existing.example"]}]}]});
+    project.write("base.json", &base.to_string());
+    let output = project.run("", "a.example, Direct\n*, Proxy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = project.read_compiled();
+    let sets = config["route"]["rule_set"].as_array().unwrap();
+    assert_eq!(sets[0], base["route"]["rule_set"][0]);
+    let extended = sets[1]["tag"].as_str().unwrap();
+    assert!(extended.starts_with(stem));
+    assert_eq!(extended.len(), 2);
+    assert_eq!(config["route"]["rules"][0]["rule_set"], json!([extended]));
+}

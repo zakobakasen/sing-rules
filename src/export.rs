@@ -42,12 +42,7 @@ pub fn export(
             _ => {}
         }
     }
-    let mut registry = Registry {
-        format,
-        used,
-        sets: &mut sets,
-        by_content: BTreeMap::new(),
-    };
+    let mut registry = Registry::default();
 
     for rule in &mut base["route"]["rules"].as_array_mut().unwrap()[route_prefix..] {
         registry.convert(rule)?;
@@ -57,20 +52,43 @@ pub fn export(
             registry.convert(rule)?;
         }
     }
+    let mut tag_by_id = vec![String::new(); registry.by_content.len()];
+    let tags = crate::tags::allocate(registry.by_content.keys().map(Vec::as_slice), &used);
+    for ((bytes, id), tag) in registry.by_content.into_iter().zip(tags) {
+        let set = match format {
+            Format::Inline => {
+                let source: Value = serde_json::from_slice(&bytes)?;
+                json!({"type":"inline", "tag":tag, "rules":source["rules"]})
+            }
+            Format::Srs { output, sing_box } => {
+                let path = export_srs(output, sing_box, &bytes, &tag)?;
+                json!({"type":"local", "tag":tag, "format":"binary", "path":path})
+            }
+        };
+        sets.push(set);
+        tag_by_id[id] = tag;
+    }
+
+    for rule in &mut base["route"]["rules"].as_array_mut().unwrap()[route_prefix..] {
+        write_tags(rule, &tag_by_id);
+    }
+    if has_dns {
+        for rule in base["dns"]["rules"].as_array_mut().unwrap() {
+            write_tags(rule, &tag_by_id);
+        }
+    }
     if had_sets || !sets.is_empty() {
         base["route"]["rule_set"] = Value::Array(sets);
     }
     Ok(())
 }
 
-struct Registry<'a, 'b> {
-    format: Format<'a>,
-    used: BTreeSet<String>,
-    sets: &'b mut Vec<Value>,
-    by_content: BTreeMap<String, String>,
+#[derive(Default)]
+struct Registry {
+    by_content: BTreeMap<Vec<u8>, usize>,
 }
 
-impl Registry<'_, '_> {
+impl Registry {
     fn convert(&mut self, rule: &mut Value) -> Result<()> {
         let Value::Object(mut condition) = std::mem::take(rule) else {
             unreachable!("generated rules are objects");
@@ -107,31 +125,25 @@ impl Registry<'_, '_> {
         Ok(())
     }
 
-    fn register(&mut self, condition: Value) -> Result<String> {
+    fn register(&mut self, condition: Value) -> Result<usize> {
         let source = json!({"version": 2, "rules": [condition]});
         let bytes = serde_json::to_vec(&source)?;
-        let key = hash(&bytes);
-        if let Some(tag) = self.by_content.get(&key) {
-            return Ok(tag.clone());
-        }
+        let next_id = self.by_content.len();
+        Ok(*self.by_content.entry(bytes).or_insert(next_id))
+    }
+}
 
-        let stem = format!("sing-rules-{}", &key[..16]);
-        let mut tag = stem.clone();
-        let mut suffix = 1;
-        while !self.used.insert(tag.clone()) {
-            tag = format!("{stem}-{suffix}");
-            suffix += 1;
+fn write_tags(rule: &mut Value, tags: &[String]) {
+    if let Some(references) = rule.get_mut("rule_set").and_then(Value::as_array_mut) {
+        for reference in references {
+            let id = reference.as_u64().unwrap() as usize;
+            *reference = json!(tags[id]);
         }
-        let set = match self.format {
-            Format::Inline => json!({"type":"inline", "tag":tag, "rules":source["rules"]}),
-            Format::Srs { output, sing_box } => {
-                let path = export_srs(output, sing_box, &bytes, &tag)?;
-                json!({"type":"local", "tag":tag, "format":"binary", "path":path})
-            }
-        };
-        self.sets.push(set);
-        self.by_content.insert(key, tag.clone());
-        Ok(tag)
+    }
+    if let Some(children) = rule.get_mut("rules").and_then(Value::as_array_mut) {
+        for child in children {
+            write_tags(child, tags);
+        }
     }
 }
 

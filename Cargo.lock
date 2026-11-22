@@ -770,6 +770,7 @@ dependencies = [
  "clap",
  "idna",
  "ipnet",
+ "ring",
  "serde_json",
  "tempfile",
  "ureq",

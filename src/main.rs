@@ -1,3 +1,4 @@
+mod cache;
 mod compiler;
 mod model;
 mod parser;
@@ -37,6 +38,10 @@ enum Commands {
         sing_box: PathBuf,
         #[arg(long, help = "Replace any existing base route.rules")]
         replace_route: bool,
+        #[arg(long, help = "Directory for downloaded rule sets")]
+        cache_dir: Option<PathBuf>,
+        #[arg(long, help = "Download rule sets again even if cached")]
+        refresh: bool,
     },
 }
 
@@ -47,10 +52,13 @@ fn main() -> Result<()> {
         output,
         sing_box,
         replace_route,
+        cache_dir,
+        refresh,
     } = Cli::parse().command;
     let text =
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
-    let table = parser::parse(&text, &input, &sing_box)?;
+    let cache = cache::Cache::new(cache_dir, refresh);
+    let table = parser::parse(&text, &input, &sing_box, &cache)?;
     let base_bytes = fs::read(&base).with_context(|| format!("reading {}", base.display()))?;
     let base_config = serde_json::from_slice(&base_bytes)
         .with_context(|| format!("parsing {}", base.display()))?;

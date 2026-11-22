@@ -1,4 +1,7 @@
-use crate::model::{self, Matcher};
+use crate::{
+    cache::{self, Cache, MAX_DOWNLOAD_BYTES},
+    model::{self, Matcher},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{fs, path::Path, process::Command, time::Duration};
@@ -47,6 +50,7 @@ fn web_agent(url: &str) -> Result<ureq::Agent> {
         .into())
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 pub enum Source {
     File(String),
     Url(String),
@@ -70,28 +74,55 @@ impl Source {
     }
 }
 
-pub fn load(source: &Source, directory: &Path, sing_box: &Path) -> Result<Vec<(Matcher, String)>> {
-    let (location, bytes) = match source {
+pub fn load(
+    source: &Source,
+    directory: &Path,
+    sing_box: &Path,
+    cache: &Cache,
+) -> Result<Vec<(Matcher, String)>> {
+    let url = match source {
         Source::File(path) => {
             let path = directory.join(path);
             let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            (path.display().to_string(), bytes)
+            return decode(&bytes, &path.display().to_string(), sing_box);
         }
-        Source::Url(url) => {
-            let mut response = web_agent(url)?
-                .get(url)
-                .call()
-                .with_context(|| format!("fetching {url}"))?;
-            let bytes = response
-                .body_mut()
-                .with_config()
-                .limit(64 * 1024 * 1024)
-                .read_to_vec()
-                .with_context(|| format!("reading {url}"))?;
-            (url.clone(), bytes)
-        }
+        Source::Url(url) => url,
     };
 
+    let entry = cache.entry(url);
+    if let Some(path) = &entry
+        && let Some(bytes) = cache.read(path)
+    {
+        match decode(&bytes, url, sing_box) {
+            Ok(rules) => return Ok(rules),
+            Err(error) => eprintln!(
+                "warning: ignoring invalid cache entry {}: {error:#}",
+                path.display()
+            ),
+        }
+    }
+
+    let mut response = web_agent(url)?
+        .get(url)
+        .call()
+        .with_context(|| format!("fetching {url}"))?;
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_DOWNLOAD_BYTES)
+        .read_to_vec()
+        .with_context(|| format!("reading {url}"))?;
+    let rules = decode(&bytes, url, sing_box)?;
+    if let Some(path) = &entry
+        && let Err(error) = cache::write(path, &bytes)
+    {
+        eprintln!("warning: writing ruleset cache {}: {error}", path.display());
+    }
+    Ok(rules)
+}
+
+fn decode(bytes: &[u8], location: &str, sing_box: &Path) -> Result<Vec<(Matcher, String)>> {
+    let decompiled;
     let bytes = if bytes.starts_with(b"SRS") {
         if bytes.get(3) == Some(&1) {
             bail!(
@@ -113,12 +144,13 @@ pub fn load(source: &Source, directory: &Path, sing_box: &Path) -> Result<Vec<(M
             "{location}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        fs::read(output)?
+        decompiled = fs::read(output)?;
+        decompiled.as_slice()
     } else {
         bytes
     };
 
-    let value: Value = serde_json::from_slice(&bytes)
+    let value: Value = serde_json::from_slice(bytes)
         .with_context(|| format!("{location}: invalid ruleset JSON"))?;
     let object = value
         .as_object()

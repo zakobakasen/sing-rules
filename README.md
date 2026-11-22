@@ -49,6 +49,12 @@ sing-box check -c compiled.json
 
 支持 sing-box JSON 规则集版本 1 至 5，以及可由本地 sing-box 反编译的 SRS 版本 2 至 5。使用 `--sing-box /path/to/sing-box` 可指定反编译程序。规则集中的目标域名、域名后缀、IP 和由这些条件构成的逻辑 OR 可以展开。遇到 `domain_regex`、`port` 等其他字段时，编译器向标准错误输出警告，并继续导入同一条规则里的目标域名、域名后缀和 IP。因此省略端口一类的限制后，保留的匹配项会适用于更广的流量。逻辑 AND 和取反会警告并跳过整条规则。支持字段的值格式错误或导入了带旧版后缀语义的 SRS 版本 1 时，编译会报错。导入项和手写规则共享优先级，输出使用内联条件。
 
+### 远程规则集缓存
+
+`url(...)` 按 URL 缓存已成功解析的下载文件，24 小时内重复编译可直接复用。同一个 URL 用多个规则集名称引用时也共用缓存。缓存过期时重新下载，刷新失败会报错，旧文件仍保留。 `file(...)` 每次编译读取本地文件。
+
+Windows 默认目录为 `%LOCALAPPDATA%/sing-rules/cache/rulesets`，macOS 为 `~/Library/Caches/sing-rules/rulesets`，Linux 为 `$XDG_CACHE_HOME/sing-rules/rulesets` 或 `~/.cache/sing-rules/rulesets`。使用 `--cache-dir <目录>` 指定其他路径，使用 `--refresh` 跳过缓存并重新下载。
+
 ## 测试
 
 ```sh

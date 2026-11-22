@@ -1,4 +1,5 @@
 use crate::{
+    cache::Cache,
     model::{self, Matcher, PRIVATE_IP, REJECT, Table},
     ruleset::{self, Source},
 };
@@ -11,7 +12,7 @@ enum Block {
     Table,
 }
 
-pub fn parse(text: &str, path: &Path, sing_box: &Path) -> Result<Table> {
+pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<Table> {
     let mut table = Table::default();
     let mut state = Block::Top;
     let mut outbound_seen = false;
@@ -99,10 +100,10 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path) -> Result<Table> {
                 let source = sources
                     .get(content)
                     .with_context(|| format!("unknown ruleset {content:?}"))?;
-                if !imported.contains_key(content) {
-                    imported.insert(content, ruleset::load(source, directory, sing_box)?);
+                if !imported.contains_key(source) {
+                    imported.insert(source, ruleset::load(source, directory, sing_box, cache)?);
                 }
-                for (matcher, origin) in &imported[content] {
+                for (matcher, origin) in &imported[source] {
                     table.add(matcher.clone(), &target, format!("{at} ({origin})"))?;
                 }
                 return Ok(());

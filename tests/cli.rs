@@ -19,6 +19,10 @@ impl Project {
     }
 
     fn run(&self, declarations: &str, table: &str) -> Output {
+        self.run_with(declarations, table, &[])
+    }
+
+    fn run_with(&self, declarations: &str, table: &str, extra: &[&str]) -> Output {
         self.write("routes.rules", &format!(
             "outbound {{\n Proxy\n Direct\n Aliyun\n}}\n{declarations}\ntable default {{\n{table}\n}}\n"
         ));
@@ -31,7 +35,10 @@ impl Project {
                 "base.json",
                 "-o",
                 "compiled.json",
+                "--cache-dir",
+                "ruleset-cache",
             ])
+            .args(extra)
             .output()
             .unwrap()
     }
@@ -616,19 +623,18 @@ fn verifies_generated_conditions_with_real_sing_box() {
     }
 }
 
-#[test]
-fn downloads_and_expands_a_url_ruleset() {
+fn serve_ruleset(
+    listener: std::net::TcpListener,
+    payload: &'static str,
+) -> std::thread::JoinHandle<()> {
     use std::{
         io::{BufRead, BufReader, Write},
-        net::TcpListener,
         thread,
         time::Duration,
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
+    thread::spawn(move || {
         let mut stream = (0..150)
             .find_map(|_| {
                 listener.accept().ok().or_else(|| {
@@ -648,7 +654,6 @@ fn downloads_and_expands_a_url_ruleset() {
                 break;
             }
         }
-        let payload = r#"{"version":2,"rules":[{"ip_cidr":["203.0.113.0/24"]}]}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -656,17 +661,62 @@ fn downloads_and_expands_a_url_ruleset() {
             payload
         )
         .unwrap();
-    });
+    })
+}
+
+#[test]
+fn caches_remote_rulesets_across_compiles_and_refreshes_them() {
+    use std::{
+        fs::FileTimes,
+        net::TcpListener,
+        time::{Duration, SystemTime},
+    };
+    const ORIGINAL: &str = r#"{"version":2,"rules":[{"ip_cidr":["203.0.113.0/24"]}]}"#;
+    const UPDATED: &str = r#"{"version":2,"rules":[{"domain":"new.example"}]}"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = serve_ruleset(listener.try_clone().unwrap(), ORIGINAL);
     let project = Project::new();
-    let config = project.compile(
-        &format!("ruleset c.n~1 = url(\"http://{addr}/ip.json\")"),
-        "RuleSet, c.n~1, Aliyun\n*, Proxy",
+    let declarations = format!(
+        "ruleset c.n~1 = url(\"http://{addr}/ip.json\")\nruleset alias = url(\"http://{addr}/ip.json\")"
     );
+    let table = "RuleSet, c.n~1, Aliyun\nRuleSet, alias, Aliyun\n*, Proxy";
+    let first = project.compile(&declarations, table);
     server.join().unwrap();
     assert_eq!(
-        output_match(&config, None, Some("203.0.113.4".parse().unwrap())),
+        output_match(&first, None, Some("203.0.113.4".parse().unwrap())),
         "Aliyun"
     );
+    assert_eq!(project.compile(&declarations, table), first);
+
+    let server = serve_ruleset(listener.try_clone().unwrap(), "an invalid download");
+    let failed = project.run_with(&declarations, table, &["--refresh"]);
+    assert!(!failed.status.success());
+    server.join().unwrap();
+    assert_eq!(project.compile(&declarations, table), first);
+
+    let server = serve_ruleset(listener.try_clone().unwrap(), UPDATED);
+    let output = project.run_with(&declarations, table, &["--refresh"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let updated = project.compile(&declarations, table);
+    assert_eq!(output_match(&updated, Some("new.example"), None), "Aliyun");
+
+    let cache = project.0.path().join("ruleset-cache");
+    let entry = fs::read_dir(cache).unwrap().next().unwrap().unwrap().path();
+    std::fs::File::open(entry)
+        .unwrap()
+        .set_times(
+            FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(25 * 3600)),
+        )
+        .unwrap();
+    let server = serve_ruleset(listener, ORIGINAL);
+    assert_eq!(project.compile(&declarations, table), first);
+    server.join().unwrap();
 }
 
 #[test]

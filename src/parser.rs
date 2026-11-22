@@ -1,22 +1,47 @@
 use crate::{
     cache::Cache,
-    model::{self, Matcher, PRIVATE_IP, REJECT, Rule, Table},
+    model::{self, Config, DEFAULT_PRIORITY, Matcher, PRIVATE_IP, REJECT, Rule, Table},
     ruleset::{self, Source},
 };
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+#[derive(Clone, Copy)]
+enum Section {
+    Route,
+    Dns,
+}
+
+impl Section {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Route => "route",
+            Self::Dns => "dns",
+        }
+    }
+
+    fn target_kind(self) -> &'static str {
+        match self {
+            Self::Route => "outbound",
+            Self::Dns => "DNS server",
+        }
+    }
+}
 
 enum Block {
     Top,
-    Outbound,
-    Table,
+    Targets(Section),
+    Rules(Section),
 }
 
-pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<Table> {
-    let mut table = Table::default();
+pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<Config> {
+    let mut route = Table::default();
+    let mut dns = Table::default();
     let mut state = Block::Top;
-    let mut outbound_seen = false;
-    let mut table_seen = false;
+    let mut blocks = BTreeSet::new();
     let mut sources = BTreeMap::new();
     let mut rows = Vec::new();
 
@@ -28,15 +53,17 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
         let at = format!("{}:{}", path.display(), index + 1);
         let result = (|| -> Result<()> {
             match state {
-                Block::Top if line == "outbound {" => {
-                    ensure!(!outbound_seen, "duplicate outbound block");
-                    outbound_seen = true;
-                    state = Block::Outbound;
-                }
-                Block::Top if line == "table default {" => {
-                    ensure!(!table_seen, "duplicate default table");
-                    table_seen = true;
-                    state = Block::Table;
+                Block::Top
+                    if matches!(line, "outbounds {" | "route {" | "dns-server {" | "dns {") =>
+                {
+                    ensure!(blocks.insert(line), "duplicate {line}");
+                    state = match line {
+                        "outbounds {" => Block::Targets(Section::Route),
+                        "route {" => Block::Rules(Section::Route),
+                        "dns-server {" => Block::Targets(Section::Dns),
+                        "dns {" => Block::Rules(Section::Dns),
+                        _ => unreachable!(),
+                    };
                 }
                 Block::Top if line.starts_with("ruleset ") => {
                     let (name, source) = line[8..]
@@ -51,18 +78,24 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                         Source::parse(source.trim()).with_context(|| format!("ruleset {name}"))?,
                     );
                 }
-                Block::Top => bail!("expected outbound, ruleset, or table default declaration"),
-                Block::Outbound if line == "}" => state = Block::Top,
-                Block::Outbound => {
+                Block::Top => {
+                    bail!("expected outbounds, route, dns-server, dns, or ruleset declaration")
+                }
+                Block::Targets(_) | Block::Rules(_) if line == "}" => state = Block::Top,
+                Block::Targets(section) => {
                     let tag = tag(line)?;
+                    let table = match section {
+                        Section::Route => &mut route,
+                        Section::Dns => &mut dns,
+                    };
                     ensure!(tag != REJECT, "{REJECT} is a reserved action");
                     ensure!(
-                        table.outbounds.insert(tag.clone()),
-                        "duplicate outbound {tag:?}"
+                        table.targets.insert(tag.clone()),
+                        "duplicate {} {tag:?}",
+                        section.target_kind()
                     );
                 }
-                Block::Table if line == "}" => state = Block::Top,
-                Block::Table => rows.push((line, at.clone())),
+                Block::Rules(section) => rows.push((section, line, at.clone())),
             }
             Ok(())
         })();
@@ -73,28 +106,45 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
         "{}: missing closing brace",
         path.display()
     );
-    ensure!(table_seen, "{}: missing table default", path.display());
-    ensure!(outbound_seen, "{}: missing outbound block", path.display());
+    ensure!(
+        blocks.contains("route {"),
+        "{}: missing route block",
+        path.display()
+    );
+    ensure!(
+        blocks.contains("outbounds {"),
+        "{}: missing outbounds block",
+        path.display()
+    );
+    let has_dns = blocks.contains("dns {");
+    ensure!(
+        !has_dns || blocks.contains("dns-server {"),
+        "{}: dns requires a dns-server block",
+        path.display()
+    );
     let directory = path.parent().context("invalid DSL path")?;
     let mut imported = BTreeMap::new();
 
-    for (line, at) in rows {
+    for (section, line, at) in rows {
+        let is_dns = matches!(section, Section::Dns);
+        let table = if is_dns { &mut dns } else { &mut route };
         let result = (|| -> Result<()> {
             let fields: Vec<_> = split(line, ',').map(str::trim).collect();
             let (kind, content, target, priority) = match fields.as_slice() {
-                [content, target] => (None, *content, *target, 0),
-                [kind, content, target] => (Some(*kind), *content, *target, 0),
+                [content, target] => (None, *content, *target, DEFAULT_PRIORITY),
+                [kind, content, target] => (Some(*kind), *content, *target, DEFAULT_PRIORITY),
                 ["RuleSet", content, target, option] => {
                     (Some("RuleSet"), *content, *target, parse_priority(option)?)
                 }
                 _ => {
-                    bail!("expected [type,] match, outbound or RuleSet, name, outbound, priority=N")
+                    bail!("expected [type,] match, target or RuleSet, name, target, integer")
                 }
             };
             let target = tag(target)?;
             ensure!(
-                target == REJECT || table.outbounds.contains(&target),
-                "undeclared outbound {target:?}"
+                target == REJECT || table.targets.contains(&target),
+                "undeclared {} {target:?}",
+                section.target_kind()
             );
 
             let rule = |source| Rule {
@@ -106,7 +156,11 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
             if kind == Some("RuleSet") {
                 validate_name(content)?;
                 if content == PRIVATE_IP {
-                    table.add(Matcher::PrivateIp, rule(at.clone()));
+                    if is_dns {
+                        warn_no_dns_rules(&at, content);
+                    } else {
+                        table.add(Matcher::PrivateIp, rule(at.clone()));
+                    }
                     return Ok(());
                 }
                 let source = sources
@@ -115,33 +169,64 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                 if !imported.contains_key(source) {
                     imported.insert(source, ruleset::load(source, directory, sing_box, cache)?);
                 }
+                let mut any = false;
                 for (matcher, origin) in &imported[source] {
-                    table.add(matcher.clone(), rule(format!("{at} ({origin})")));
+                    if !is_dns || matches!(matcher, Matcher::Exact(_) | Matcher::Suffix { .. }) {
+                        table.add(matcher.clone(), rule(format!("{at} ({origin})")));
+                        any = true;
+                    }
+                }
+                if is_dns && !any {
+                    warn_no_dns_rules(&at, content);
                 }
             } else {
-                table.add(parse_matcher(kind, content)?, rule(at.clone()));
+                let matcher = parse_matcher(kind, content)?;
+                ensure!(
+                    !is_dns || !matches!(matcher, Matcher::Ip(_)),
+                    "IP rules are not allowed in dns"
+                );
+                ensure!(
+                    !is_dns || matcher != Matcher::Any || target != REJECT,
+                    "DNS fallback (*) must name a DNS server"
+                );
+                table.add(matcher, rule(at.clone()));
             }
             Ok(())
         })();
         result.with_context(|| at)?;
     }
 
-    ensure!(
-        table.rules.contains_key(&Matcher::Any),
-        "{}: missing global fallback (*, outbound)",
-        path.display()
-    );
-    table.check_conflicts()?;
-    Ok(table)
+    for (section, table) in [
+        (Section::Route, Some(&route)),
+        (Section::Dns, has_dns.then_some(&dns)),
+    ] {
+        if let Some(table) = table {
+            ensure!(
+                table.rules.contains_key(&Matcher::Any),
+                "{}: missing {} global fallback (*, {})",
+                path.display(),
+                section.name(),
+                section.target_kind()
+            );
+            table
+                .check_conflicts()
+                .with_context(|| format!("in {} block", section.name()))?;
+        }
+    }
+    Ok(Config {
+        route,
+        dns: has_dns.then_some(dns),
+    })
 }
 
-fn parse_priority(option: &str) -> Result<i32> {
-    let (key, value) = option.split_once('=').context("expected priority=N")?;
-    ensure!(key.trim() == "priority", "expected priority=N");
-    value
-        .trim()
+fn warn_no_dns_rules(at: &str, name: &str) {
+    eprintln!("warning: {at}: RuleSet {name} has no domain rules for dns");
+}
+
+fn parse_priority(option: &str) -> Result<i64> {
+    option
         .parse()
-        .context("priority must be a signed 32-bit integer")
+        .context("priority must be a signed 64-bit integer in the fourth column")
 }
 
 fn validate_name(name: &str) -> Result<()> {

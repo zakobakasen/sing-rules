@@ -24,7 +24,7 @@ impl Project {
 
     fn run_with(&self, declarations: &str, table: &str, extra: &[&str]) -> Output {
         self.write("routes.rules", &format!(
-            "outbound {{\n Proxy\n Direct\n Aliyun\n}}\n{declarations}\ntable default {{\n{table}\n}}\n"
+            "outbounds {{\n Proxy\n Direct\n Aliyun\n}}\n{declarations}\nroute {{\n{table}\n}}\n"
         ));
         Command::new(env!("CARGO_BIN_EXE_sing-rules"))
             .current_dir(self.0.path())
@@ -114,9 +114,9 @@ fn merges_unrelated_prefixes_across_lengths_and_is_order_independent() {
     let project = Project::new();
     let rows = [
         "10.0.0.0/8, Direct",
-        "10.1.0.0/16, REJECT",
+        "10.1.0.0/16, Reject",
         "10.1.2.0/24, Direct",
-        "172.16.1.0/24, REJECT",
+        "172.16.1.0/24, Reject",
         "*, Proxy",
     ];
     let initial = project.compile("", &rows.join("\n"));
@@ -174,7 +174,7 @@ fn warns_and_keeps_supported_ruleset_fields() {
     ]}"#);
     let output = project.run(
         r#"ruleset ads = file("ads.json")"#,
-        "RuleSet, ads, REJECT\n*, Proxy",
+        "RuleSet, ads, Reject\n*, Proxy",
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
@@ -197,7 +197,7 @@ fn warns_and_keeps_supported_ruleset_fields() {
         "port-qualified.example",
         "or.example",
     ] {
-        assert_eq!(output_match(&config, Some(host), None), "REJECT", "{host}");
+        assert_eq!(output_match(&config, Some(host), None), "Reject", "{host}");
     }
     for host in [
         "only-regex.example",
@@ -209,7 +209,7 @@ fn warns_and_keeps_supported_ruleset_fields() {
     }
     assert_eq!(
         output_match(&config, None, Some("203.0.113.4".parse().unwrap())),
-        "REJECT"
+        "Reject"
     );
 }
 
@@ -222,7 +222,7 @@ fn still_rejects_malformed_supported_ruleset_fields() {
     );
     project.error(
         r#"ruleset ads = file("ads.json")"#,
-        "RuleSet, ads, REJECT\n*, Proxy",
+        "RuleSet, ads, Reject\n*, Proxy",
         "rules[0].ip_cidr[0]",
     );
 }
@@ -230,7 +230,7 @@ fn still_rejects_malformed_supported_ruleset_fields() {
 #[test]
 fn distinguishes_family_defaults_and_global_reject() {
     let project = Project::new();
-    let config = project.compile("", "0.0.0.0/0, Direct\n::/0, Aliyun\n*, REJECT");
+    let config = project.compile("", "0.0.0.0/0, Direct\n::/0, Aliyun\n*, Reject");
     let rules = config["route"]["rules"].as_array().unwrap();
     assert!(rules.iter().any(|rule| rule["outbound"] == "Direct"));
     assert!(rules.iter().any(|rule| rule["outbound"] == "Aliyun"));
@@ -250,7 +250,7 @@ fn handles_inclusive_imports_and_strict_suffix_exceptions() {
         "
         RuleSet, sites, Direct
         *.a.com, Aliyun
-        api.a.com, REJECT
+        api.a.com, Reject
         *, Proxy
     ",
     );
@@ -258,7 +258,7 @@ fn handles_inclusive_imports_and_strict_suffix_exceptions() {
         ("a.com", "Direct"),
         ("b.a.com", "Aliyun"),
         ("x.b.a.com", "Aliyun"),
-        ("api.a.com", "REJECT"),
+        ("api.a.com", "Reject"),
         ("nota.com", "Proxy"),
     ] {
         assert_eq!(output_match(&config, Some(host), None), target, "{host}");
@@ -279,7 +279,7 @@ fn randomized_prefixes_match_reference_lookup() {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         state >> 32
     };
-    let targets = ["Direct", "Aliyun", "Proxy", "REJECT"];
+    let targets = ["Direct", "Aliyun", "Proxy", "Reject"];
 
     for _ in 0..24 {
         let mut rules = BTreeMap::new();
@@ -327,7 +327,7 @@ fn output_match(config: &Value, host: Option<&str>, ip: Option<std::net::IpAddr>
         .iter()
         .find(|rule| rule["action"] != "resolve" && matches_output(rule, host, ip));
     match matched {
-        Some(rule) if rule["action"] == "reject" => "REJECT",
+        Some(rule) if rule["action"] == "reject" => "Reject",
         Some(rule) => rule["outbound"].as_str().unwrap(),
         None => route["final"].as_str().unwrap(),
     }
@@ -403,7 +403,7 @@ fn expands_srs_with_real_sing_box() {
         "{}",
         String::from_utf8_lossy(&encoded.stderr)
     );
-    project.write("routes.rules", "outbound {\nDirect\nProxy\n}\nruleset sites = file(\"source.srs\")\ntable default {\nRuleSet, sites, Direct\n*, Proxy\n}\n");
+    project.write("routes.rules", "outbounds {\nDirect\nProxy\n}\nruleset sites = file(\"source.srs\")\nroute {\nRuleSet, sites, Direct\n*, Proxy\n}\n");
     let result = Command::new(env!("CARGO_BIN_EXE_sing-rules"))
         .current_dir(project.0.path())
         .args([
@@ -448,9 +448,9 @@ fn verifies_real_routing_with_sniffed_domain_and_destination_ip() {
         "",
         "
         127.0.0.1, Aliyun
-        RuleSet, PrivateIP, REJECT
+        RuleSet, PrivateIP, Reject
         a.com, Direct
-        *.a.com, REJECT
+        *.a.com, Reject
         *, Proxy
     ",
     );
@@ -559,7 +559,7 @@ fn verifies_generated_conditions_with_real_sing_box() {
         ::/0, Aliyun
         a.com, Direct
         *.a.com, Aliyun
-        RuleSet, PrivateIP, REJECT
+        RuleSet, PrivateIP, Reject
         *, Proxy
     ",
     );
@@ -725,9 +725,9 @@ fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
     let config = project.compile(
         "",
         "
-        a.com, REJECT
+        a.com, Reject
         203.0.113.0/24, Direct
-        192.0.2.0/24, REJECT
+        192.0.2.0/24, Reject
         2001:db8::/32, Aliyun
         *, Proxy
     ",
@@ -749,12 +749,12 @@ fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
     );
 
     let expected_routes = [
-        (Some("a.com"), None, &[][..], ("REJECT", false)),
+        (Some("a.com"), None, &[][..], ("Reject", false)),
         (
             Some("a.com"),
             Some("203.0.113.4"),
             &[][..],
-            ("REJECT", false),
+            ("Reject", false),
         ),
         (
             Some("b.com"),
@@ -770,7 +770,7 @@ fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
         ),
         (None, Some("198.51.100.8"), &[][..], ("Proxy", false)),
         (Some("b.com"), None, &["203.0.113.4"][..], ("Direct", true)),
-        (Some("b.com"), None, &["192.0.2.9"][..], ("REJECT", true)),
+        (Some("b.com"), None, &["192.0.2.9"][..], ("Reject", true)),
         (Some("b.com"), None, &["198.51.100.8"][..], ("Proxy", true)),
         (
             Some("b.com"),
@@ -782,7 +782,7 @@ fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
             Some("b.com"),
             None,
             &["203.0.113.4", "192.0.2.9"][..],
-            ("REJECT", true),
+            ("Reject", true),
         ),
     ];
     for (host, ip, answers, (action, resolved)) in expected_routes {
@@ -797,10 +797,10 @@ fn resolves_only_domain_misses_and_rechecks_only_ip_rules() {
 #[test]
 fn resolves_against_all_address_families_without_masking_ipv6() {
     let project = Project::new();
-    let config = project.compile("", "10.0.0.0/8, Direct\n::/80, REJECT\n*, Proxy");
+    let config = project.compile("", "10.0.0.0/8, Direct\n::/80, Reject\n*, Proxy");
     assert_eq!(
         route_with_dns(&config, Some("b.com"), None, &["::1", "::ffff:10.0.0.1"]),
-        ("REJECT".into(), true)
+        ("Reject".into(), true)
     );
     assert_eq!(
         route_with_dns(&config, Some("b.com"), None, &["::ffff:10.0.0.1"]),
@@ -830,7 +830,7 @@ fn route_with_dns(
                     .map(|answer| answer.parse().unwrap())
                     .collect();
             }
-            "reject" => return ("REJECT".into(), resolved),
+            "reject" => return ("Reject".into(), resolved),
             "route" => return (rule["outbound"].as_str().unwrap().into(), resolved),
             action => panic!("{action}"),
         }
@@ -843,7 +843,7 @@ fn omits_dns_when_ip_rules_cannot_change_the_fallback() {
     let project = Project::new();
     let config = project.compile(
         "",
-        "a.com, REJECT\n203.0.113.0/24, Proxy\nRuleSet, PrivateIP, Proxy\n*, Proxy",
+        "a.com, Reject\n203.0.113.0/24, Proxy\nRuleSet, PrivateIP, Proxy\n*, Proxy",
     );
     let rules = config["route"]["rules"].as_array().unwrap();
     assert_eq!(rules.len(), 1);
@@ -863,9 +863,9 @@ fn ruleset_priority_breaks_ties_without_overriding_more_specific_rules() {
     );
     project.write("cn.json", r#"{"version":5,"rules":[{"domain_suffix":"byteadverts.com","domain":"api.byteadverts.com","ip_cidr":["10.0.0.0/8","10.2.0.0/16"]}]}"#);
     let imports = "ruleset ads = file(\"ads.json\")\nruleset cn = file(\"cn.json\")";
-    let ads = "RuleSet, ads, REJECT, priority=100";
+    let ads = "RuleSet, ads, Reject, 100";
     let cn = "RuleSet, cn, Direct";
-    let another_cn = "RuleSet, cn, Aliyun, priority=-1";
+    let another_cn = "RuleSet, cn, Aliyun, 40000";
     let output = project.compile(imports, &format!("{cn}\n{ads}\n{another_cn}\n*, Proxy"));
     assert_eq!(
         output,
@@ -873,11 +873,11 @@ fn ruleset_priority_breaks_ties_without_overriding_more_specific_rules() {
     );
     assert_eq!(
         output_match(&output, Some("byteadverts.com"), None),
-        "REJECT"
+        "Reject"
     );
     assert_eq!(
         output_match(&output, Some("x.byteadverts.com"), None),
-        "REJECT"
+        "Reject"
     );
     assert_eq!(
         output_match(&output, Some("api.byteadverts.com"), None),
@@ -885,7 +885,7 @@ fn ruleset_priority_breaks_ties_without_overriding_more_specific_rules() {
     );
     assert_eq!(
         output_match(&output, None, Some("10.1.0.1".parse().unwrap())),
-        "REJECT"
+        "Reject"
     );
     assert_eq!(
         output_match(&output, None, Some("10.2.0.1".parse().unwrap())),
@@ -902,7 +902,7 @@ fn reports_both_ruleset_actions_and_the_tied_priority() {
     let imports = "ruleset ads = file(\"ads.json\")\nruleset cn = file(\"cn.json\")";
     let result = project.run(
         imports,
-        "RuleSet, ads, REJECT\nRuleSet, cn, Direct, priority=0\n*, Proxy",
+        "RuleSet, ads, Reject\nRuleSet, cn, Direct, 32766\n*, Proxy",
     );
     assert!(!result.status.success());
     let report = String::from_utf8_lossy(&result.stderr);
@@ -912,9 +912,9 @@ fn reports_both_ruleset_actions_and_the_tied_priority() {
         "including subdomains",
         "RuleSet ads",
         "RuleSet cn",
-        "REJECT",
+        "Reject",
         "Direct",
-        "priority=0",
+        "priority=32766",
         "ads.json:rules[0]",
         "cn.json:rules[0]",
     ] {
@@ -922,22 +922,14 @@ fn reports_both_ruleset_actions_and_the_tied_priority() {
     }
     let higher = project.compile(
         imports,
-        "RuleSet, cn, Direct\nRuleSet, ads, REJECT\nRuleSet, cn, Aliyun, priority=5\n*, Proxy",
+        "RuleSet, cn, Direct\nRuleSet, ads, Reject\nRuleSet, cn, Aliyun, 5\n*, Proxy",
     );
     assert_eq!(
         output_match(&higher, Some("byteadverts.com"), None),
         "Aliyun"
     );
-    project.error(
-        imports,
-        "RuleSet, ads, REJECT, priority=high\n*, Proxy",
-        "priority",
-    );
-    project.error(
-        "",
-        "Domain, example.com, Proxy, priority=1\n*, Proxy",
-        "expected",
-    );
+    project.error(imports, "RuleSet, ads, Reject, high\n*, Proxy", "priority");
+    project.error("", "Domain, example.com, Proxy, 1\n*, Proxy", "expected");
 }
 
 #[test]
@@ -952,7 +944,7 @@ fn base_rules_run_before_generated_rules_when_requested() {
     ]);
     base["route"] = json!({"rules": native, "final": "Aliyun", "auto_detect_interface": true});
     project.write("base.json", &base.to_string());
-    let table = "blocked.example, REJECT\n203.0.113.0/24, Direct\n*, Proxy";
+    let table = "blocked.example, Reject\n203.0.113.0/24, Direct\n*, Proxy";
 
     project.error("", table, "--base-rules-first");
     assert!(
@@ -997,4 +989,143 @@ fn base_rules_run_before_generated_rules_when_requested() {
         preserved_rules[2..],
         replaced["route"]["rules"].as_array().unwrap()[..]
     );
+}
+
+#[test]
+fn compiles_route_and_dns_with_independent_targets_and_priorities() {
+    let project = Project::new();
+    project.write("base.json", r#"{
+        "outbounds":[{"type":"direct","tag":"Direct"},{"type":"direct","tag":"Proxy"}],
+        "route":{"default_domain_resolver":"local-dns"},
+        "dns":{"servers":[{"type":"udp","tag":"local-dns","server":"192.0.2.53"},{"type":"udp","tag":"remote-dns","server":"198.51.100.53"}],
+               "rules":[{"domain":["old.example"],"action":"route","server":"local-dns"}],"final":"local-dns","disable_cache":true}
+    }"#);
+    project.write("mixed.json", r#"{"version":5,"rules":[{"domain_suffix":"example.com","domain":"api.example.com","ip_cidr":"192.0.2.0/24"}]}"#);
+    project.write(
+        "ads.json",
+        r#"{"version":5,"rules":[{"domain_suffix":"example.com"}]}"#,
+    );
+    project.write(
+        "ips.json",
+        r#"{"version":5,"rules":[{"ip_cidr":"192.0.2.0/24"}]}"#,
+    );
+    project.write(
+        "new.rules",
+        r#"
+ruleset mixed = file("mixed.json")
+ruleset ads = file("ads.json")
+ruleset ips = file("ips.json")
+outbounds {
+    Direct
+    Proxy
+}
+dns-server {
+    local-dns
+    remote-dns
+}
+route {
+    RuleSet, mixed, Direct
+    RuleSet, ads, Reject, 100
+    *, Proxy
+}
+dns {
+    RuleSet, mixed, local-dns
+    RuleSet, ads, Reject, -9223372036854775808
+    RuleSet, ips, remote-dns
+    RuleSet, PrivateIP, remote-dns
+    *, remote-dns
+}
+"#,
+    );
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sing-rules"))
+            .current_dir(project.0.path())
+            .args([
+                "compile",
+                "new.rules",
+                "--base",
+                "base.json",
+                "-o",
+                "compiled.json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("ips") && stderr.contains("PrivateIP"),
+        "{stderr}"
+    );
+    let config: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    assert_eq!(config["route"]["final"], "Proxy");
+    assert_eq!(config["dns"]["final"], "remote-dns");
+    assert_eq!(config["dns"]["disable_cache"], true);
+    assert_eq!(config["dns"]["servers"].as_array().unwrap().len(), 2);
+    assert!(
+        config["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule.get("ip_cidr").is_some())
+    );
+    let dns = config["dns"]["rules"].as_array().unwrap();
+    assert_eq!(dns.len(), 2);
+    assert_eq!(dns[0]["domain"][0], "api.example.com");
+    assert_eq!(dns[0]["server"], "local-dns");
+    assert_eq!(dns[1]["action"], "reject");
+    assert!(
+        dns.iter()
+            .all(|rule| rule.get("ip_cidr").is_none() && rule.get("outbound").is_none())
+    );
+    if let Some(binary) = std::env::var_os("SING_BOX") {
+        let checked = Command::new(binary)
+            .current_dir(project.0.path())
+            .args(["check", "-c", "compiled.json"])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    let input = fs::read_to_string(project.0.path().join("new.rules")).unwrap();
+    for (old, new, expected) in [
+        (
+            "*, remote-dns",
+            "192.0.2.1, local-dns\n*, remote-dns",
+            "IP rules",
+        ),
+        ("*, remote-dns", "*, Reject", "DNS fallback"),
+        (
+            "    remote-dns\n}",
+            "    missing-dns\n}",
+            "undeclared DNS server",
+        ),
+        (
+            "-9223372036854775808",
+            "9223372036854775808",
+            "signed 64-bit",
+        ),
+    ] {
+        project.write("new.rules", &input.replace(old, new));
+        let output = run();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "{stderr}"
+        );
+    }
+
+    project.write("new.rules", input.split("\ndns {").next().unwrap());
+    assert!(run().status.success());
+    let config: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    let base: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("base.json")).unwrap()).unwrap();
+    assert_eq!(config["dns"], base["dns"]);
 }

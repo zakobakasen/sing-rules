@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let text =
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
     let cache = cache::Cache::new(cache_dir, refresh);
-    let table = parser::parse(&text, &input, &sing_box, &cache)?;
+    let config = parser::parse(&text, &input, &sing_box, &cache)?;
     let base_bytes = fs::read(&base).with_context(|| format!("reading {}", base.display()))?;
     let base_config = serde_json::from_slice(&base_bytes)
         .with_context(|| format!("parsing {}", base.display()))?;
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
     } else {
         compiler::BaseRules::RequireEmpty
     };
-    let config = compiler::compile(&table, base_config, base_rules)?;
+    let config = compiler::compile(&config, base_config, base_rules)?;
     if let Some(output) = output {
         let parent = output
             .parent()

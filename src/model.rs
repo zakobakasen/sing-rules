@@ -7,7 +7,8 @@ use std::{
 };
 
 pub const PRIVATE_IP: &str = "PrivateIP";
-pub const REJECT: &str = "REJECT";
+pub const REJECT: &str = "Reject";
+pub const DEFAULT_PRIORITY: i64 = 32766;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Matcher {
@@ -22,7 +23,7 @@ pub struct Rule {
     pub target: String,
     pub source: String,
     pub ruleset: Option<String>,
-    pub priority: i32,
+    pub priority: i64,
 }
 
 impl Rule {
@@ -38,9 +39,14 @@ impl Rule {
     }
 }
 
+pub struct Config {
+    pub route: Table,
+    pub dns: Option<Table>,
+}
+
 #[derive(Default)]
 pub struct Table {
-    pub outbounds: BTreeSet<String>,
+    pub targets: BTreeSet<String>,
     pub rules: BTreeMap<Matcher, Rule>,
     conflicts: BTreeMap<Matcher, Rule>,
 }
@@ -52,7 +58,7 @@ impl Table {
                 entry.insert(rule);
             }
             Entry::Occupied(mut entry) => match rule.priority.cmp(&entry.get().priority) {
-                Ordering::Greater => {
+                Ordering::Less => {
                     self.conflicts.remove(entry.key());
                     entry.insert(rule);
                 }
@@ -83,7 +89,7 @@ impl Table {
                 Matcher::Any => "global fallback (*)".into(),
             };
             let help = if first.ruleset.is_some() || second.ruleset.is_some() {
-                "\n  help: set priority=... on the RuleSet reference that should win"
+                "\n  help: use a smaller integer in the fourth column of the RuleSet that should win"
             } else {
                 ""
             };

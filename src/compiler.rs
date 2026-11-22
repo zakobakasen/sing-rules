@@ -1,4 +1,4 @@
-use crate::model::{self, Matcher, REJECT, Table};
+use crate::model::{self, Config, Matcher, REJECT, Table};
 use anyhow::{Context, Result, ensure};
 use ipnet::{IpNet, Ipv6Net};
 use serde_json::{Map, Value, json};
@@ -27,17 +27,54 @@ pub enum BaseRules {
     First,
 }
 
-pub fn compile(table: &Table, mut base: Value, base_rules: BaseRules) -> Result<Value> {
+pub fn compile(config: &Config, mut base: Value, base_rules: BaseRules) -> Result<Value> {
     let root = base
         .as_object_mut()
         .context("base configuration must be an object")?;
+    compile_route(&config.route, root, base_rules)?;
+    if let Some(table) = &config.dns {
+        compile_dns(table, root)?;
+    }
+    Ok(base)
+}
+
+fn compile_dns(table: &Table, root: &mut Map<String, Value>) -> Result<()> {
+    let dns = root
+        .get_mut("dns")
+        .and_then(Value::as_object_mut)
+        .context("dns block requires a base dns object with servers")?;
+    let tags = dns
+        .get("servers")
+        .and_then(Value::as_array)
+        .context("dns block requires base dns.servers")?;
+    for target in &table.targets {
+        ensure!(
+            tags.iter()
+                .any(|server| server.get("tag").and_then(Value::as_str) == Some(target)),
+            "DNS server {target:?} is missing from base dns.servers"
+        );
+    }
+    let rules = domain_layers(table)
+        .into_iter()
+        .map(|layer| emit(layer, false, "server"))
+        .collect();
+    dns.insert("rules".into(), Value::Array(rules));
+    dns.insert("final".into(), json!(table.rules[&Matcher::Any].target));
+    Ok(())
+}
+
+fn compile_route(
+    table: &Table,
+    root: &mut Map<String, Value>,
+    base_rules: BaseRules,
+) -> Result<()> {
     let tags: BTreeSet<_> = ["outbounds", "endpoints"]
         .into_iter()
         .filter_map(|field| root.get(field).and_then(Value::as_array))
         .flatten()
         .filter_map(|item| item.get("tag").and_then(Value::as_str))
         .collect();
-    for tag in &table.outbounds {
+    for tag in &table.targets {
         ensure!(
             tags.contains(tag.as_str()),
             "outbound {tag:?} is missing from base configuration"
@@ -83,11 +120,18 @@ pub fn compile(table: &Table, mut base: Value, base_rules: BaseRules) -> Result<
             push_layer(&mut layers, layer);
         }
     }
-    let mut rules: Vec<_> = layers.into_iter().map(|layer| emit(layer, false)).collect();
+    let mut rules: Vec<_> = layers
+        .into_iter()
+        .map(|layer| emit(layer, false, "outbound"))
+        .collect();
     if needs_dns {
         // Every existing IP has decided its route before an unmatched domain reaches resolve.
         let mut known_ip_fallback = json!({"ip_cidr": ["0.0.0.0/0", "::/0"]});
-        set_action(known_ip_fallback.as_object_mut().unwrap(), fallback);
+        set_action(
+            known_ip_fallback.as_object_mut().unwrap(),
+            fallback,
+            "outbound",
+        );
         rules.push(known_ip_fallback);
         rules.push(json!({"action": "resolve"}));
 
@@ -95,7 +139,11 @@ pub fn compile(table: &Table, mut base: Value, base_rules: BaseRules) -> Result<
         for layer in trailing_ip_layers {
             push_layer(&mut resolved_layers, layer);
         }
-        rules.extend(resolved_layers.into_iter().map(|layer| emit(layer, true)));
+        rules.extend(
+            resolved_layers
+                .into_iter()
+                .map(|layer| emit(layer, true, "outbound")),
+        );
     }
     if fallback == REJECT {
         if let Some(last) = rules.last_mut().filter(|last| last["action"] == "reject") {
@@ -110,7 +158,7 @@ pub fn compile(table: &Table, mut base: Value, base_rules: BaseRules) -> Result<
     let mut combined = prefix;
     combined.append(&mut rules);
     route.insert("rules".into(), Value::Array(combined));
-    Ok(base)
+    Ok(())
 }
 
 fn trailing_ip_layers_for_table<'a>(table: &'a Table, fallback: &str) -> Vec<Layer<'a>> {
@@ -306,7 +354,7 @@ fn push_layer<'a>(layers: &mut Vec<Layer<'a>>, layer: Layer<'a>) {
     }
 }
 
-fn emit(layer: Layer<'_>, multiple_addresses: bool) -> Value {
+fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value {
     let mut ip = Vec::new();
     let mut ipv6_excluding_mapped = Vec::new();
     let mut exact = BTreeSet::new();
@@ -366,15 +414,15 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool) -> Value {
         };
         rule = combined.as_object().unwrap().clone();
     }
-    set_action(&mut rule, layer.action);
+    set_action(&mut rule, layer.action, target_field);
     Value::Object(rule)
 }
 
-fn set_action(rule: &mut Map<String, Value>, target: &str) {
+fn set_action(rule: &mut Map<String, Value>, target: &str, target_field: &str) {
     let action = if target == REJECT {
         "reject"
     } else {
-        rule.insert("outbound".into(), json!(target));
+        rule.insert(target_field.into(), json!(target));
         "route"
     };
     rule.insert("action".into(), json!(action));

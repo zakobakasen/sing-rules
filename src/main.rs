@@ -1,11 +1,12 @@
 mod cache;
 mod compiler;
+mod export;
 mod model;
 mod parser;
 mod ruleset;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     fs,
     io::{self, Write},
@@ -22,6 +23,12 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum RulesetFormat {
+    Inline,
+    Srs,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Compile {
@@ -33,9 +40,16 @@ enum Commands {
         #[arg(
             long,
             default_value = "sing-box",
-            help = "Executable used to decompile SRS imports"
+            help = "Executable used to read or write SRS files"
         )]
         sing_box: PathBuf,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "inline",
+            help = "Output format for generated rule sets"
+        )]
+        ruleset_format: RulesetFormat,
         #[arg(long, help = "Replace any existing base route.rules")]
         replace_route: bool,
         #[arg(
@@ -57,6 +71,7 @@ fn main() -> Result<()> {
         base,
         output,
         sing_box,
+        ruleset_format,
         replace_route,
         base_rules_first,
         cache_dir,
@@ -76,7 +91,16 @@ fn main() -> Result<()> {
     } else {
         compiler::BaseRules::RequireEmpty
     };
-    let config = compiler::compile(&config, base_config, base_rules)?;
+    let format = match ruleset_format {
+        RulesetFormat::Inline => export::Format::Inline,
+        RulesetFormat::Srs => export::Format::Srs {
+            output: output
+                .as_deref()
+                .context("--ruleset-format srs requires --output")?,
+            sing_box: &sing_box,
+        },
+    };
+    let config = compiler::compile(&config, base_config, base_rules, format)?;
     if let Some(output) = output {
         let parent = output
             .parent()

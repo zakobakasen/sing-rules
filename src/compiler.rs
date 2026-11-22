@@ -27,14 +27,20 @@ pub enum BaseRules {
     First,
 }
 
-pub fn compile(config: &Config, mut base: Value, base_rules: BaseRules) -> Result<Value> {
+pub fn compile(
+    config: &Config,
+    mut base: Value,
+    base_rules: BaseRules,
+    format: crate::export::Format<'_>,
+) -> Result<Value> {
     let root = base
         .as_object_mut()
         .context("base configuration must be an object")?;
-    compile_route(&config.route, root, base_rules)?;
+    let prefix = compile_route(&config.route, root, base_rules)?;
     if let Some(table) = &config.dns {
         compile_dns(table, root)?;
     }
+    crate::export::export(&mut base, prefix, config.dns.is_some(), format)?;
     Ok(base)
 }
 
@@ -67,7 +73,7 @@ fn compile_route(
     table: &Table,
     root: &mut Map<String, Value>,
     base_rules: BaseRules,
-) -> Result<()> {
+) -> Result<usize> {
     let tags: BTreeSet<_> = ["outbounds", "endpoints"]
         .into_iter()
         .filter_map(|field| root.get(field).and_then(Value::as_array))
@@ -156,9 +162,10 @@ fn compile_route(
         route.insert("final".into(), json!(fallback));
     }
     let mut combined = prefix;
+    let prefix_len = combined.len();
     combined.append(&mut rules);
     route.insert("rules".into(), Value::Array(combined));
-    Ok(())
+    Ok(prefix_len)
 }
 
 fn trailing_ip_layers_for_table<'a>(table: &'a Table, fallback: &str) -> Vec<Layer<'a>> {

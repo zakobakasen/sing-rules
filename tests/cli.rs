@@ -50,6 +50,10 @@ impl Project {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        expanded_conditions(&self.read_compiled())
+    }
+
+    fn read_compiled(&self) -> Value {
         serde_json::from_slice(&fs::read(self.0.path().join("compiled.json")).unwrap()).unwrap()
     }
 
@@ -58,6 +62,42 @@ impl Project {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+// Reconstruct the match expressions used by the differential tests from
+// the emitted inline definitions, leaving route actions on the outer rules.
+fn expanded_conditions(config: &Value) -> Value {
+    let mut expanded = config.clone();
+    let mut definitions = std::collections::BTreeMap::new();
+    for set in config["route"]["rule_set"].as_array().into_iter().flatten() {
+        if set["type"] == "inline" {
+            definitions.insert(set["tag"].as_str().unwrap(), &set["rules"][0]);
+        }
+    }
+    for section in ["route", "dns"] {
+        if let Some(rules) = expanded
+            .get_mut(section)
+            .and_then(|section| section.get_mut("rules"))
+            .and_then(Value::as_array_mut)
+        {
+            for rule in rules {
+                expand_condition(rule, &definitions);
+            }
+        }
+    }
+    expanded
+}
+
+fn expand_condition(rule: &mut Value, definitions: &std::collections::BTreeMap<&str, &Value>) {
+    let fields = rule.as_object_mut().unwrap();
+    if let Some(reference) = fields.remove("rule_set") {
+        let condition = definitions[reference[0].as_str().unwrap()];
+        fields.extend(condition.as_object().unwrap().clone());
+    } else if let Some(children) = fields.get_mut("rules").and_then(Value::as_array_mut) {
+        for child in children.iter_mut() {
+            expand_condition(child, definitions);
+        }
     }
 }
 
@@ -93,8 +133,12 @@ fn compiles_the_agreed_syntax_and_native_private_ip() {
             .iter()
             .any(|rule| rule["domain_suffix"] == json!([".a.com", ".a.com."]))
     );
-    assert!(rules.iter().any(|rule| rule["ip_is_private"] == true));
-    assert!(route.get("rule_set").is_none());
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule.to_string().contains("ip_is_private"))
+    );
+    assert!(route.get("rule_set").is_some());
     if let Some(binary) = std::env::var_os("SING_BOX") {
         let checked = Command::new(binary)
             .current_dir(project.0.path())
@@ -189,8 +233,7 @@ fn warns_and_keeps_supported_ruleset_fields() {
     ] {
         assert!(stderr.contains(part), "missing {part}: {stderr}");
     }
-    let config =
-        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    let config = expanded_conditions(&project.read_compiled());
     for host in [
         "ads.example",
         "x.tracker.example",
@@ -421,7 +464,7 @@ fn expands_srs_with_real_sing_box() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let config = serde_json::from_slice(&result.stdout).unwrap();
+    let config = expanded_conditions(&serde_json::from_slice(&result.stdout).unwrap());
     assert_eq!(output_match(&config, Some("b.a.com"), None), "Direct");
     assert_eq!(output_match(&config, Some("a.com"), None), "Proxy");
     assert_eq!(
@@ -444,7 +487,7 @@ fn verifies_real_routing_with_sniffed_domain_and_destination_ip() {
     let binary = std::env::var_os("SING_BOX_RUNTIME")
         .expect("set SING_BOX_RUNTIME to the sing-box executable");
     let project = Project::new();
-    let mut config = project.compile(
+    project.compile(
         "",
         "
         127.0.0.1, Aliyun
@@ -454,6 +497,7 @@ fn verifies_real_routing_with_sniffed_domain_and_destination_ip() {
         *, Proxy
     ",
     );
+    let mut config = project.read_compiled();
     let inbound = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = inbound.local_addr().unwrap().port();
     drop(inbound);
@@ -584,7 +628,7 @@ fn verifies_generated_conditions_with_real_sing_box() {
         let fields = condition.as_object_mut().unwrap();
         fields.remove("action");
         fields.remove("outbound");
-        if fields.is_empty() || fields.contains_key("ip_is_private") {
+        if fields.is_empty() || rule.to_string().contains("ip_is_private") {
             // ip_is_private is a route-only field.
             continue;
         }
@@ -1058,8 +1102,15 @@ dns {
         stderr.contains("ips") && stderr.contains("PrivateIP"),
         "{stderr}"
     );
-    let config: Value =
-        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    let raw = project.read_compiled();
+    assert!(
+        raw["dns"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule.get("rule_set").is_some())
+    );
+    let config = expanded_conditions(&raw);
     assert_eq!(config["route"]["final"], "Proxy");
     assert_eq!(config["dns"]["final"], "remote-dns");
     assert_eq!(config["dns"]["disable_cache"], true);
@@ -1081,9 +1132,40 @@ dns {
             .all(|rule| rule.get("ip_cidr").is_none() && rule.get("outbound").is_none())
     );
     if let Some(binary) = std::env::var_os("SING_BOX") {
-        let checked = Command::new(binary)
+        let checked = Command::new(&binary)
             .current_dir(project.0.path())
             .args(["check", "-c", "compiled.json"])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let generated = Command::new(env!("CARGO_BIN_EXE_sing-rules"))
+            .current_dir(project.0.path())
+            .args([
+                "compile",
+                "new.rules",
+                "--base",
+                "base.json",
+                "-o",
+                "binary.json",
+                "--ruleset-format",
+                "srs",
+                "--sing-box",
+            ])
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let checked = Command::new(binary)
+            .current_dir(project.0.path())
+            .args(["check", "-c", "binary.json"])
             .output()
             .unwrap();
         assert!(
@@ -1128,4 +1210,88 @@ dns {
     let base: Value =
         serde_json::from_slice(&fs::read(project.0.path().join("base.json")).unwrap()).unwrap();
     assert_eq!(config["dns"], base["dns"]);
+}
+
+#[test]
+fn generated_matchers_use_rule_sets_and_private_ip_is_a_separate_or_branch() {
+    let project = Project::new();
+    let result = project.run(
+        "",
+        "192.0.2.0/24, Direct\nRuleSet, PrivateIP, Direct\n*, Proxy",
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let config: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    let route = &config["route"];
+    let first = &route["rules"][0];
+    assert_eq!(first["type"], "logical");
+    assert_eq!(first["mode"], "or");
+    assert_eq!(first["rules"][1], json!({"ip_is_private":true}));
+    let tag = &first["rules"][0]["rule_set"][0];
+    let sets = route["rule_set"].as_array().unwrap();
+    assert_eq!(sets.iter().filter(|set| set["tag"] == *tag).count(), 1);
+    assert!(sets.iter().all(|set| set["type"] == "inline"));
+    assert!(
+        sets.iter()
+            .all(|set| !set.to_string().contains("ip_is_private"))
+    );
+    assert!(
+        route["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule.get("ip_cidr").is_none())
+    );
+}
+
+#[test]
+fn exports_srs_alongside_configuration() {
+    let project = Project::new();
+    let requested = project.run_with(
+        "",
+        "example.com, Direct\n*, Proxy",
+        &[
+            "--ruleset-format",
+            "srs",
+            "--sing-box",
+            "nonexistent-sing-box",
+        ],
+    );
+    assert!(!requested.status.success());
+    let Some(binary) = std::env::var_os("SING_BOX") else {
+        return;
+    };
+    let result = project.run_with("", "*.example.com, Direct\n192.0.2.0/24, Direct\n::/80, Direct\nRuleSet, PrivateIP, Direct\n*, Proxy",
+        &["--ruleset-format", "srs", "--sing-box", binary.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let config: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("compiled.json")).unwrap()).unwrap();
+    for set in config["route"]["rule_set"].as_array().unwrap() {
+        assert_eq!(set["type"], "local");
+        assert_eq!(set["format"], "binary");
+        let path = set["path"].as_str().unwrap();
+        assert!(
+            fs::read(project.0.path().join(path))
+                .unwrap()
+                .starts_with(b"SRS")
+        );
+    }
+    let checked = Command::new(binary)
+        .current_dir(project.0.path())
+        .args(["check", "-c", "compiled.json"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
 }

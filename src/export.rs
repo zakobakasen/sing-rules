@@ -139,8 +139,7 @@ fn take_private(condition: &mut Map<String, Value>) -> bool {
     if condition.remove("ip_is_private").is_some() {
         return true;
     }
-    // The compiler can wrap the ordinary destination fields in an OR
-    // alongside an IPv6 guard. PrivateIP is only in the ordinary branch.
+    // PrivateIP is only in the first, ordinary branch of a generated OR.
     if condition.get("mode").and_then(Value::as_str) != Some("or") {
         return false;
     }
@@ -150,8 +149,11 @@ fn take_private(condition: &mut Map<String, Value>) -> bool {
         return false;
     }
     if ordinary.is_empty() {
-        let guarded = branches.pop().unwrap();
-        *condition = guarded.as_object().unwrap().clone();
+        branches.remove(0);
+        if branches.len() == 1 {
+            let guarded = branches.pop().unwrap();
+            *condition = guarded.as_object().unwrap().clone();
+        }
     }
     true
 }

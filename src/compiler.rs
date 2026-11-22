@@ -229,6 +229,19 @@ fn resolved_ip_layers(table: &Table) -> Vec<Layer<'_>> {
 }
 
 fn domain_layers(table: &Table) -> Vec<Layer<'_>> {
+    let mut regions: BTreeMap<&str, Vec<&Matcher>> = BTreeMap::new();
+    for (matcher, rule) in &table.rules {
+        if matches!(matcher, Matcher::DomainRegion { .. }) {
+            regions.entry(&rule.target).or_default().push(matcher);
+        }
+    }
+    if !regions.is_empty() {
+        return regions
+            .into_iter()
+            .map(|(action, matchers)| Layer { action, matchers })
+            .collect();
+    }
+
     let mut candidates: Vec<_> = table
         .rules
         .keys()
@@ -367,6 +380,7 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value
     let mut exact = BTreeSet::new();
     let mut suffix = BTreeSet::new();
     let mut rule = Map::new();
+    let mut branches = Vec::new();
     for matcher in layer.matchers {
         match matcher {
             Matcher::Ip(IpNet::V4(net)) => {
@@ -393,6 +407,26 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value
                 suffix.insert(format!("{prefix}{name}"));
                 suffix.insert(format!("{prefix}{name}."));
             }
+            Matcher::DomainRegion { scope, excluded } => {
+                if excluded.is_empty() {
+                    use crate::domain_set::Kind;
+                    let (field, prefix) = match scope.kind {
+                        Kind::Exact => (&mut exact, ""),
+                        Kind::Inclusive => (&mut suffix, ""),
+                        Kind::Descendants => (&mut suffix, "."),
+                    };
+                    field.insert(format!("{prefix}{}", scope.name));
+                    field.insert(format!("{prefix}{}.", scope.name));
+                } else {
+                    let mut children = vec![domain_condition(scope)];
+                    children.extend(excluded.iter().map(|hole| {
+                        let mut condition = domain_condition(hole);
+                        condition["invert"] = json!(true);
+                        condition
+                    }));
+                    branches.push(json!({"type": "logical", "mode": "and", "rules": children}));
+                }
+            }
             Matcher::PrivateIp => {
                 rule.insert("ip_is_private".into(), json!(true));
             }
@@ -409,20 +443,34 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value
         }
     }
     if !ipv6_excluding_mapped.is_empty() {
-        let guarded = json!({"type": "logical", "mode": "and", "rules": [
+        branches.push(json!({"type": "logical", "mode": "and", "rules": [
             {"ip_cidr": cidrs(ipv6_excluding_mapped)},
             {"ip_cidr": [model::mapped_network().to_string()], "invert": true}
-        ]});
-        let ordinary = Value::Object(rule);
-        let combined = if ordinary.as_object().unwrap().is_empty() {
-            guarded
+        ]}));
+    }
+    if !branches.is_empty() {
+        if !rule.is_empty() {
+            branches.insert(0, Value::Object(rule));
+        }
+        let combined = if branches.len() == 1 {
+            branches.pop().unwrap()
         } else {
-            json!({"type": "logical", "mode": "or", "rules": [ordinary, guarded]})
+            json!({"type": "logical", "mode": "or", "rules": branches})
         };
         rule = combined.as_object().unwrap().clone();
     }
     set_action(&mut rule, layer.action, target_field);
     Value::Object(rule)
+}
+
+fn domain_condition(scope: &crate::domain_set::Scope) -> Value {
+    use crate::domain_set::Kind;
+    let name = &scope.name;
+    match scope.kind {
+        Kind::Exact => json!({"domain": [name, format!("{name}.")]}),
+        Kind::Inclusive => json!({"domain_suffix": [name, format!("{name}.")]}),
+        Kind::Descendants => json!({"domain_suffix": [format!(".{name}"), format!(".{name}.")]}),
+    }
 }
 
 fn set_action(rule: &mut Map<String, Value>, target: &str, target_field: &str) {

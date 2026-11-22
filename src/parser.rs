@@ -1,7 +1,8 @@
 use crate::{
     cache::Cache,
+    domain_set::{self, Scope},
     model::{self, Config, DEFAULT_PRIORITY, Matcher, PRIVATE_IP, REJECT, Rule, Table},
-    ruleset::{self, Source},
+    set_expr::{self, Definition, Expr, Resolver},
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -68,14 +69,18 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                 Block::Top if line.starts_with("ruleset ") => {
                     let (name, source) = line[8..]
                         .split_once('=')
-                        .context("expected ruleset NAME = file(...) or url(...)")?;
+                        .context("expected ruleset NAME = expression")?;
                     let name = name.trim();
                     validate_name(name)?;
                     ensure!(name != PRIVATE_IP, "reserved ruleset name {name}");
                     ensure!(!sources.contains_key(name), "duplicate ruleset {name}");
                     sources.insert(
                         name,
-                        Source::parse(source.trim()).with_context(|| format!("ruleset {name}"))?,
+                        Definition {
+                            expr: set_expr::parse(source.trim())
+                                .with_context(|| format!("ruleset {name}"))?,
+                            location: at.clone(),
+                        },
                     );
                 }
                 Block::Top => {
@@ -123,10 +128,20 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
         path.display()
     );
     let directory = path.parent().context("invalid DSL path")?;
-    let mut imported = BTreeMap::new();
+    set_expr::validate(&sources)?;
+    let mut resolver = Resolver {
+        definitions: &sources,
+        imports: BTreeMap::new(),
+        resolved: BTreeMap::new(),
+        directory,
+        sing_box,
+        cache,
+    };
+    let mut domain_rules = [DomainRules::default(), DomainRules::default()];
 
     for (section, line, at) in rows {
         let is_dns = matches!(section, Section::Dns);
+        let domains = &mut domain_rules[usize::from(is_dns)];
         let table = if is_dns { &mut dns } else { &mut route };
         let result = (|| -> Result<()> {
             let fields: Vec<_> = split(line, ',').map(str::trim).collect();
@@ -163,20 +178,38 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                     }
                     return Ok(());
                 }
-                let source = sources
+                let definition = sources
                     .get(content)
                     .with_context(|| format!("unknown ruleset {content:?}"))?;
-                if !imported.contains_key(source) {
-                    imported.insert(source, ruleset::load(source, directory, sing_box, cache)?);
-                }
-                let mut any = false;
-                for (matcher, origin) in &imported[source] {
-                    if !is_dns || matches!(matcher, Matcher::Exact(_) | Matcher::Suffix { .. }) {
-                        table.add(matcher.clone(), rule(format!("{at} ({origin})")));
-                        any = true;
+                let mut any_domain = false;
+                if let Expr::Source(source) = &definition.expr {
+                    for (matcher, origin) in resolver.source(source)? {
+                        let rule = rule(format!("{at} ({origin})"));
+                        if let Some(scope) = Scope::from_matcher(matcher) {
+                            domains.plain.entry(scope).or_default().push(rule);
+                            any_domain = true;
+                        } else if !is_dns {
+                            table.add(matcher.clone(), rule);
+                        }
+                    }
+                } else {
+                    let resolved = resolver.resolve(content)?;
+                    if !is_dns {
+                        for ip in &resolved.ips {
+                            table.add(
+                                Matcher::Ip(*ip),
+                                rule(format!("{at} ({})", definition.location)),
+                            );
+                        }
+                    }
+                    any_domain = resolved.domains.values().any(Option::is_some);
+                    if any_domain {
+                        domains
+                            .derived
+                            .push((content, rule(format!("{at} ({})", definition.location))));
                     }
                 }
-                if is_dns && !any {
+                if is_dns && !any_domain {
                     warn_no_dns_rules(&at, content);
                 }
             } else {
@@ -189,13 +222,34 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
                     !is_dns || matcher != Matcher::Any || target != REJECT,
                     "DNS fallback (*) must name a DNS server"
                 );
-                table.add(matcher, rule(at.clone()));
+                let rule = rule(at.clone());
+                if let Some(scope) = Scope::from_matcher(&matcher) {
+                    domains.plain.entry(scope).or_default().push(rule);
+                } else {
+                    table.add(matcher, rule);
+                }
             }
             Ok(())
         })();
         result.with_context(|| at)?;
     }
 
+    for (domains, table) in domain_rules.into_iter().zip([&mut route, &mut dns]) {
+        if domains.derived.is_empty() {
+            for (scope, rules) in domains.plain {
+                for rule in rules {
+                    table.add(scope.matcher(), rule);
+                }
+            }
+        } else {
+            let derived = domains
+                .derived
+                .into_iter()
+                .map(|(name, rule)| (&resolver.resolved[name].domains, rule))
+                .collect();
+            domain_set::install(table, domains.plain, derived)?;
+        }
+    }
     for (section, table) in [
         (Section::Route, Some(&route)),
         (Section::Dns, has_dns.then_some(&dns)),
@@ -217,6 +271,12 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
         route,
         dns: has_dns.then_some(dns),
     })
+}
+
+#[derive(Default)]
+struct DomainRules<'a> {
+    plain: BTreeMap<Scope, Vec<Rule>>,
+    derived: Vec<(&'a str, Rule)>,
 }
 
 fn warn_no_dns_rules(at: &str, name: &str) {

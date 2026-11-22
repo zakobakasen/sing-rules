@@ -1295,3 +1295,267 @@ fn exports_srs_alongside_configuration() {
         String::from_utf8_lossy(&checked.stderr)
     );
 }
+
+#[test]
+fn ruleset_set_algebra_is_exact_and_respects_precedence() {
+    let project = Project::new();
+    project.write(
+        "a.json",
+        r#"{"version":2,"rules":[{"domain_suffix":[".a.com"],"ip_cidr":["192.0.2.0/24"]}]}"#,
+    );
+    project.write("b.json", r#"{"version":2,"rules":[{"domain":["b.a.com"],"domain_suffix":[".c.a.com"],"ip_cidr":["192.0.2.0/26"]}]}"#);
+    project.write("c.json", r#"{"version":2,"rules":[{"domain":["b.a.com","extra.net"],"ip_cidr":["192.0.2.0/27","2001:db8::/64"]}]}"#);
+    let imports = r#"ruleset filtered = a - b * c
+ruleset grouped = (a - b) * c
+ruleset a = file("a.json")
+ruleset b = file("b.json")
+ruleset c = file("c.json")"#;
+    let config = project.compile(
+        imports,
+        "RuleSet, filtered, Direct\n*.c.a.com, Aliyun\n*, Proxy",
+    );
+    for (host, expected) in [
+        ("b.a.com", "Proxy"),
+        ("x.b.a.com", "Direct"),
+        ("a.com", "Proxy"),
+        ("x.c.a.com", "Aliyun"),
+        ("c.a.com", "Direct"),
+        ("extra.net", "Proxy"),
+    ] {
+        assert_eq!(output_match(&config, Some(host), None), expected, "{host}");
+    }
+    for (ip, expected) in [
+        ("192.0.2.5", "Proxy"),
+        ("192.0.2.32", "Direct"),
+        ("2001:db8::1", "Proxy"),
+    ] {
+        assert_eq!(
+            output_match(&config, None, Some(ip.parse().unwrap())),
+            expected,
+            "{ip}"
+        );
+    }
+    let empty = project.compile(imports, "RuleSet, grouped, Direct\n*, Proxy");
+    assert!(empty["route"]["rules"].as_array().unwrap().is_empty());
+    let refill = project.compile(
+        &format!("{imports}\nruleset refill = (a - b) + c"),
+        "RuleSet, refill, Direct\n*, Proxy",
+    );
+    assert_eq!(output_match(&refill, Some("b.a.com"), None), "Direct");
+    assert_eq!(output_match(&refill, Some("x.c.a.com"), None), "Proxy");
+    assert_eq!(output_match(&refill, Some("extra.net"), None), "Direct");
+    let removed = project.compile(
+        &format!("{imports}\nruleset removed = a - b - c"),
+        "RuleSet, removed, Direct\n*, Proxy",
+    );
+    assert_eq!(output_match(&removed, Some("b.a.com"), None), "Proxy");
+    assert_eq!(output_match(&removed, Some("x.c.a.com"), None), "Proxy");
+
+    if let Some(binary) = std::env::var_os("SING_BOX") {
+        for format in ["inline", "srs"] {
+            let result = project.run_with(
+                imports,
+                "RuleSet, filtered, Direct\n*, Proxy",
+                &[
+                    "--ruleset-format",
+                    format,
+                    "--sing-box",
+                    binary.to_str().unwrap(),
+                ],
+            );
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let checked = Command::new(&binary)
+                .current_dir(project.0.path())
+                .args(["check", "-c", "compiled.json"])
+                .output()
+                .unwrap();
+            assert!(
+                checked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&checked.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn reports_cycles_and_unknown_references_even_in_unused_rulesets() {
+    let project = Project::new();
+    project.error(
+        "ruleset alpha = beta + gamma\nruleset beta = gamma\nruleset gamma = alpha",
+        "*, Proxy",
+        "alpha -> beta -> gamma -> alpha",
+    );
+    project.error("ruleset alpha = alpha", "*, Proxy", "alpha -> alpha");
+    project.error(
+        "ruleset alpha = missing",
+        "*, Proxy",
+        "unknown ruleset \"missing\"",
+    );
+    project.error("ruleset alpha = (beta + )", "*, Proxy", "expected");
+    project.error("ruleset alpha = PrivateIP", "*, Proxy", "PrivateIP");
+}
+
+#[test]
+fn dns_set_difference_leaves_holes_for_other_rules_and_fallback() {
+    let project = Project::new();
+    project.write("base.json", r#"{"outbounds":[{"type":"direct","tag":"Direct"}],
+        "route":{"default_domain_resolver":"local"},
+        "dns":{"servers":[{"type":"local","tag":"local"},{"type":"udp","tag":"remote","server":"192.0.2.53"}]}}"#);
+    project.write(
+        "all.json",
+        r#"{"version":2,"rules":[{"domain_suffix":"example.com","ip_cidr":"192.0.2.0/24"}]}"#,
+    );
+    project.write("holes.json", r#"{"version":2,"rules":[{"domain_suffix":".private.example.com","domain":"one.example.com"}]}"#);
+    project.write(
+        "route.rules",
+        r#"
+ruleset all-domains = file("all.json")
+ruleset holes = file("holes.json")
+ruleset rest = all-domains - holes
+outbounds {
+    Direct
+}
+route {
+    *, Direct
+}
+dns-server {
+    local
+    remote
+}
+dns {
+    RuleSet, rest, remote
+    one.example.com, Reject
+    *, local
+}
+"#,
+    );
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sing-rules"))
+            .current_dir(project.0.path())
+            .args([
+                "compile",
+                "route.rules",
+                "--base",
+                "base.json",
+                "-o",
+                "compiled.json",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let compiled = run(&[]);
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let raw = project.read_compiled();
+    assert!(!raw["route"]["rule_set"].to_string().contains("ip_cidr"));
+    let output = expanded_conditions(&raw);
+    let dns = &output["dns"];
+    for (host, expected) in [
+        ("example.com", "remote"),
+        ("private.example.com", "remote"),
+        ("x.private.example.com", "local"),
+        ("one.example.com", "reject"),
+        ("x.one.example.com", "remote"),
+    ] {
+        let action = dns["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| matches_output(rule, Some(host), None))
+            .and_then(|rule| rule["server"].as_str().or_else(|| rule["action"].as_str()))
+            .or_else(|| dns["final"].as_str())
+            .unwrap();
+        assert_eq!(action, expected, "{host}");
+    }
+    if let Some(binary) = std::env::var_os("SING_BOX") {
+        for format in ["inline", "srs"] {
+            let output = run(&[
+                "--ruleset-format",
+                format,
+                "--sing-box",
+                binary.to_str().unwrap(),
+            ]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let checked = Command::new(&binary)
+                .current_dir(project.0.path())
+                .args(["check", "-c", "compiled.json"])
+                .output()
+                .unwrap();
+            assert!(
+                checked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            let config = project.read_compiled();
+            let dns_rule = config["dns"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rule| rule["server"] == "remote")
+                .unwrap();
+            let tag = &dns_rule["rule_set"][0];
+            let set = config["route"]["rule_set"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|set| set["tag"] == *tag)
+                .unwrap();
+            let path = if format == "inline" {
+                project.write(
+                    "headless.json",
+                    &json!({"version":2,"rules":set["rules"]}).to_string(),
+                );
+                "headless.json"
+            } else {
+                let decoded = Command::new(&binary)
+                    .current_dir(project.0.path())
+                    .args([
+                        "rule-set",
+                        "decompile",
+                        "-o",
+                        "headless.json",
+                        set["path"].as_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    decoded.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&decoded.stderr)
+                );
+                "headless.json"
+            };
+            for (host, expected) in [
+                ("example.com", true),
+                ("x.private.example.com", false),
+                ("one.example.com", false),
+            ] {
+                let matched = Command::new(&binary)
+                    .current_dir(project.0.path())
+                    .args(["rule-set", "match", path, host])
+                    .output()
+                    .unwrap();
+                let log = String::from_utf8_lossy(&matched.stderr);
+                assert!(matched.status.success(), "{log}");
+                assert_eq!(
+                    log.contains("match rules."),
+                    expected,
+                    "{format} {host}: {log}"
+                );
+            }
+        }
+    }
+}

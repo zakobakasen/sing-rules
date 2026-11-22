@@ -14,7 +14,14 @@ pub const DEFAULT_PRIORITY: i64 = 32766;
 pub enum Matcher {
     Ip(IpNet),
     Exact(String),
-    Suffix { name: String, subdomains_only: bool },
+    Suffix {
+        name: String,
+        subdomains_only: bool,
+    },
+    DomainRegion {
+        scope: crate::domain_set::Scope,
+        excluded: Vec<crate::domain_set::Scope>,
+    },
     PrivateIp,
     Any,
 }
@@ -27,7 +34,7 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         let label = self
             .ruleset
             .as_deref()
@@ -85,6 +92,7 @@ impl Table {
                     name,
                     subdomains_only: false,
                 } => format!("domain suffix {name} (including subdomains)"),
+                Matcher::DomainRegion { scope, .. } => format!("domain region {}", scope.name),
                 Matcher::PrivateIp => "PrivateIP".into(),
                 Matcher::Any => "global fallback (*)".into(),
             };

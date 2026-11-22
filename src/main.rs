@@ -1,9 +1,11 @@
 mod cache;
 mod compiler;
+mod domain_set;
 mod export;
 mod model;
 mod parser;
 mod ruleset;
+mod set_expr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};

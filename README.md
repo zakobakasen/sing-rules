@@ -87,6 +87,20 @@ DNS 只匹配查询域名。导入 RuleSet 时，先剔除 IP 条目，再判断
 
 规则集引用可加第四列，例如 `RuleSet, ads, Reject, 100`。优先级为有符号 64 位整数，数字越小越优先，省略时取 `32766`。普通表规则也使用 `32766`。优先级只用于解决完全相同的匹配范围。更具体的域名或 CIDR 仍先匹配，改变行顺序不会改变结果。
 
+### 集合运算
+
+```text
+ruleset ads = file("./rules/ads.json")
+ruleset trackers = file("./rules/trackers.json")
+ruleset allowlist = file("./rules/allowlist.json")
+ruleset blocked = (ads + trackers) - allowlist
+ruleset common = ads * trackers
+```
+
+`+` 是并集，`-` 是差集，`*` 是交集。括号先算，`*` 次之，`+` 与 `-` 同级且从左往右结合。规则集名称允许连字符，所以用空格隔开差号，例如 `a - b`。声明可以向前引用，循环和未知名称会报错。
+
+域名与 IP 分别做集合运算。域名差集使用精确的排除条件，被排除的域名继续匹配其他规则或兜底。IP 差集拆分成等价的 CIDR，结果前缀按现有最长前缀规则参与路由。 `PrivateIP` 继续通过独立的 `RuleSet, PrivateIP, 出站` 引用。
+
 ### 规则集输出
 
 默认使用 `--ruleset-format inline`，把数据保存在生成配置的 `route.rule_set` 中。指定 `--ruleset-format srs` 时，必须同时指定 `-o`。编译器会调用 `--sing-box` 指定的程序，在配置旁的 `sing-rules-srs/` 目录写入 SRS 文件。部署时把该目录与配置一起复制，并从配置所在目录运行 sing-box，或用 `sing-box -D <目录> -c <配置>` 指定工作目录。

@@ -147,13 +147,16 @@ pub fn parse(text: &str, path: &Path, sing_box: &Path, cache: &Cache) -> Result<
             let fields: Vec<_> = split(line, ',').map(str::trim).collect();
             let (kind, content, target, priority) = match fields.as_slice() {
                 [content, target] => (None, *content, *target, DEFAULT_PRIORITY),
-                [kind, content, target] => (Some(*kind), *content, *target, DEFAULT_PRIORITY),
-                ["RuleSet", content, target, option] => {
-                    (Some("RuleSet"), *content, *target, parse_priority(option)?)
+                [
+                    kind @ ("IP" | "Domain" | "DomainSuffix" | "RuleSet" | "Any"),
+                    content,
+                    target,
+                ] => (Some(*kind), *content, *target, DEFAULT_PRIORITY),
+                [content, target, option] => (None, *content, *target, parse_priority(option)?),
+                [kind, content, target, option] => {
+                    (Some(*kind), *content, *target, parse_priority(option)?)
                 }
-                _ => {
-                    bail!("expected [type,] match, target or RuleSet, name, target, integer")
-                }
+                _ => bail!("expected [type,] match, target[, priority]"),
             };
             let target = tag(target)?;
             ensure!(
@@ -286,7 +289,7 @@ fn warn_no_dns_rules(at: &str, name: &str) {
 fn parse_priority(option: &str) -> Result<i64> {
     option
         .parse()
-        .context("priority must be a signed 64-bit integer in the fourth column")
+        .context("expected priority as a signed 64-bit integer")
 }
 
 fn validate_name(name: &str) -> Result<()> {

@@ -973,7 +973,6 @@ fn reports_both_ruleset_actions_and_the_tied_priority() {
         "Aliyun"
     );
     project.error(imports, "RuleSet, ads, Reject, high\n*, Proxy", "priority");
-    project.error("", "Domain, example.com, Proxy, 1\n*, Proxy", "expected");
 }
 
 #[test]
@@ -1558,4 +1557,24 @@ dns {
             }
         }
     }
+}
+
+#[test]
+fn ordinary_rules_accept_priority_with_or_without_a_type() {
+    let project = Project::new();
+    let config = project.compile("", "example.com, Direct\nDomain, example.com, Aliyun, 100\n203.0.113.0/24, Direct\n203.0.113.0/24, Aliyun, 100\n203.0.113.1, Direct\n*, Proxy");
+    assert_eq!(output_match(&config, Some("example.com"), None), "Aliyun");
+    assert_eq!(
+        output_match(&config, None, Some("203.0.113.2".parse().unwrap())),
+        "Aliyun"
+    );
+    assert_eq!(
+        output_match(&config, None, Some("203.0.113.1".parse().unwrap())),
+        "Direct"
+    );
+    project.error(
+        "",
+        "a.com, Direct, 32766\na.com, Aliyun\n*, Proxy",
+        "conflict",
+    );
 }

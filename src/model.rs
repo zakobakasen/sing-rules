@@ -96,13 +96,8 @@ impl Table {
                 Matcher::PrivateIp => "PrivateIP".into(),
                 Matcher::Any => "global fallback (*)".into(),
             };
-            let help = if first.ruleset.is_some() || second.ruleset.is_some() {
-                "\n  help: use a smaller integer in the fourth column of the RuleSet that should win"
-            } else {
-                ""
-            };
             bail!(
-                "conflicting rules for {scope}\n  {}\n  {}{help}",
+                "conflicting rules for {scope}\n  {}\n  {}\n  help: use a smaller priority on the rule that should win",
                 first.describe(),
                 second.describe()
             );

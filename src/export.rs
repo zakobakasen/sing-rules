@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use ring::digest::{SHA256, digest};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -196,17 +196,10 @@ fn export_srs(output: &Path, sing_box: &Path, source: &[u8], tag: &str) -> Resul
         bytes.starts_with(b"SRS"),
         "{tag}: sing-box did not produce an SRS file"
     );
-    let filename = format!("{}.srs", hash(&bytes));
+    let digest = blake3::hash(&bytes);
+    let filename = format!("{}.srs", URL_SAFE_NO_PAD.encode(digest.as_bytes()));
     let mut staged = tempfile::NamedTempFile::new_in(&directory)?;
     staged.write_all(&bytes)?;
     staged.persist(directory.join(&filename))?;
     Ok(format!("sing-rules-srs/{filename}"))
-}
-
-fn hash(bytes: &[u8]) -> String {
-    digest(&SHA256, bytes)
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

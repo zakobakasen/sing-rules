@@ -103,7 +103,7 @@ ruleset common = ads * trackers
 
 ### 规则集输出
 
-默认使用 `--ruleset-format inline`，把数据保存在生成配置的 `route.rule_set` 中。指定 `--ruleset-format srs` 时，必须同时指定 `-o`。编译器会调用 `--sing-box` 指定的程序，在配置旁的 `sing-rules-srs/` 目录写入 SRS 文件。部署时把该目录与配置一起复制，并从配置所在目录运行 sing-box，或用 `sing-box -D <目录> -c <配置>` 指定工作目录。
+默认使用 `--ruleset-format inline`，把数据保存在生成配置的 `route.rule_set` 中。指定 `--ruleset-format srs` 时，必须同时指定 `-o`。编译器会调用 `--sing-box` 指定的程序，在配置旁的 `sing-rules-srs/` 目录写入 SRS 文件。文件名是实际 SRS 内容的 256 位 BLAKE3 摘要，经无填充 Base64URL 编码后加上 `.srs`。部署时把该目录与配置一起复制，并从配置所在目录运行 sing-box，或用 `sing-box -D <目录> -c <配置>` 指定工作目录。
 
 生成的规则集使用内容派生的短标签，内联与 SRS 共用分配方式。相同条件复用标签。标签从 BLAKE3 输出流经拒绝采样得到的 `A–Z`、`a–z`、`0–9` 序列取前缀，从一字符开始。只有发生碰撞的标签才会逐字符延长，基础配置占用的标签原样保留。
 

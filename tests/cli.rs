@@ -1277,11 +1277,17 @@ fn exports_srs_alongside_configuration() {
         assert_eq!(set["type"], "local");
         assert_eq!(set["format"], "binary");
         let path = set["path"].as_str().unwrap();
-        assert!(
-            fs::read(project.0.path().join(path))
-                .unwrap()
-                .starts_with(b"SRS")
-        );
+        let bytes = fs::read(project.0.path().join(path)).unwrap();
+        assert!(bytes.starts_with(b"SRS"));
+        let stem = path
+            .strip_prefix("sing-rules-srs/")
+            .unwrap()
+            .strip_suffix(".srs")
+            .unwrap();
+        assert_eq!(stem.len(), 43);
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let decoded = URL_SAFE_NO_PAD.decode(stem).unwrap();
+        assert_eq!(decoded.as_slice(), blake3::hash(&bytes).as_bytes());
     }
     let checked = Command::new(binary)
         .current_dir(project.0.path())

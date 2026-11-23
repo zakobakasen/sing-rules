@@ -2,6 +2,7 @@ mod cache;
 mod compiler;
 mod domain_set;
 mod export;
+mod ip_opt;
 mod model;
 mod parser;
 mod ruleset;

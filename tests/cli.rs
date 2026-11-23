@@ -1621,3 +1621,287 @@ fn rooted_and_unrooted_domain_inputs_produce_identical_inline_sets() {
     assert_eq!(rules["domain"], json!(["a.example", "a.example."]));
     assert_eq!(rules["domain_suffix"], json!([".b.example", ".b.example."]));
 }
+
+#[test]
+fn compacts_carved_ip_layers_without_changing_longest_prefix_matches() {
+    let project = Project::new();
+    let config = project.compile(
+        "",
+        "
+        192.0.2.0/24, Direct
+        192.0.2.0/25, Aliyun
+        192.0.2.0/26, Direct
+        *, Proxy
+    ",
+    );
+    let rules = config["route"]["rules"].as_array().unwrap();
+    let pivot = rules
+        .iter()
+        .position(|rule| rule["action"] == "resolve")
+        .unwrap();
+    assert_eq!(pivot, 3, "two decision rules and the known-IP fallback");
+    for byte in 0..=255 {
+        let ip = format!("192.0.2.{byte}").parse().unwrap();
+        let expected = if (64..128).contains(&byte) {
+            "Aliyun"
+        } else {
+            "Direct"
+        };
+        assert_eq!(output_match(&config, None, Some(ip)), expected);
+    }
+    assert_eq!(
+        route_with_dns(
+            &config,
+            Some("example.com"),
+            None,
+            &["192.0.2.70", "192.0.2.10"]
+        ),
+        ("Direct".into(), true)
+    );
+    assert_eq!(
+        route_with_dns(
+            &config,
+            Some("example.com"),
+            None,
+            &["192.0.2.200", "192.0.2.70"]
+        ),
+        ("Aliyun".into(), true)
+    );
+}
+
+#[test]
+fn widens_a_later_ip_match_only_across_addresses_already_handled() {
+    let project = Project::new();
+    let config = project.compile(
+        "",
+        "
+        192.0.2.0/26, Aliyun
+        192.0.2.64/26, Direct
+        192.0.2.128/25, Aliyun
+        *, Proxy
+    ",
+    );
+    let first = &config["route"]["rules"][0];
+    let second = &config["route"]["rules"][1];
+    assert_eq!(first["outbound"], "Direct");
+    assert_eq!(second["outbound"], "Aliyun");
+    assert!(field_items(second, "ip_cidr").any(|cidr| cidr == "192.0.2.0/24"));
+    for byte in 0..=255 {
+        let ip = format!("192.0.2.{byte}").parse().unwrap();
+        let expected = if (64..128).contains(&byte) {
+            "Direct"
+        } else {
+            "Aliyun"
+        };
+        assert_eq!(output_match(&config, None, Some(ip)), expected);
+    }
+    assert_eq!(
+        output_match(&config, None, Some("192.0.3.0".parse().unwrap())),
+        "Proxy"
+    );
+}
+
+#[test]
+fn keeps_ip_order_when_a_base_rule_can_resolve_first() {
+    let project = Project::new();
+    let mut base: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("base.json")).unwrap()).unwrap();
+    base["route"] = json!({"rules":[{"action":"resolve"}]});
+    project.write("base.json", &base.to_string());
+    let result = project.run_with(
+        "",
+        "192.0.2.0/26, Aliyun\n192.0.2.64/26, Direct\n192.0.2.128/25, Aliyun\n*, Proxy",
+        &["--base-rules-first"],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let config = expanded_conditions(&project.read_compiled());
+    let rules = config["route"]["rules"].as_array().unwrap();
+    assert_eq!(rules[0]["action"], "resolve");
+    assert_eq!(rules[1]["outbound"], "Aliyun");
+    assert_eq!(rules[2]["outbound"], "Direct");
+    assert_eq!(
+        route_with_dns(
+            &config,
+            Some("example.com"),
+            None,
+            &["192.0.2.1", "192.0.2.70"]
+        ),
+        ("Aliyun".into(), true)
+    );
+}
+
+#[test]
+fn folds_an_exact_domain_and_all_its_subdomains_into_one_suffix() {
+    let project = Project::new();
+    let config = project.compile("", "example.com, Direct\n*.example.com, Direct\n*, Proxy");
+    let headless = &config["route"]["rule_set"][0]["rules"][0];
+    assert_eq!(
+        headless["domain_suffix"],
+        json!(["example.com", "example.com."])
+    );
+    assert!(headless.get("domain").is_none());
+    for host in [
+        "example.com",
+        "example.com.",
+        "a.b.example.com",
+        "a.example.com.",
+    ] {
+        assert_eq!(output_match(&config, Some(host), None), "Direct", "{host}");
+    }
+    for host in ["notexample.com", "example.com.other"] {
+        assert_eq!(output_match(&config, Some(host), None), "Proxy", "{host}");
+    }
+}
+
+#[test]
+fn compacts_nested_domain_rules_in_route_and_dns_without_losing_exceptions() {
+    let project = Project::new();
+    let mut base: Value =
+        serde_json::from_slice(&fs::read(project.0.path().join("base.json")).unwrap()).unwrap();
+    base["dns"] = json!({"servers":[
+        {"type":"local","tag":"local"},
+        {"type":"udp","tag":"remote","server":"192.0.2.53"}
+    ]});
+    base["route"] = json!({"default_domain_resolver":"local"});
+    project.write("base.json", &base.to_string());
+    project.write(
+        "nested.sr",
+        "
+outbounds {
+    Direct
+    Aliyun
+    Proxy
+}
+route {
+    *.example.com, Direct
+    *.ads.example.com, Aliyun
+    safe.ads.example.com, Direct
+    *, Proxy
+}
+dns-server {
+    local
+    remote
+}
+dns {
+    *.example.com, local
+    *.ads.example.com, Reject
+    safe.ads.example.com, local
+    *, remote
+}
+",
+    );
+    let run = |output: &str, options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sing-rules"))
+            .current_dir(project.0.path())
+            .args(["compile", "nested.sr", "--base", "base.json", "-o", output])
+            .args(options)
+            .output()
+            .unwrap()
+    };
+    let output = run("compiled.json", &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = expanded_conditions(&project.read_compiled());
+    assert_eq!(config["route"]["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(config["dns"]["rules"].as_array().unwrap().len(), 2);
+
+    for (host, route, dns) in [
+        ("example.com", "Proxy", "remote"),
+        ("ads.example.com", "Direct", "local"),
+        ("safe.ads.example.com", "Direct", "local"),
+        ("safe.ads.example.com.", "Direct", "local"),
+        ("x.safe.ads.example.com", "Aliyun", "reject"),
+        ("x.ads.example.com.", "Aliyun", "reject"),
+        ("x.example.com", "Direct", "local"),
+        ("notexample.com", "Proxy", "remote"),
+    ] {
+        assert_eq!(output_match(&config, Some(host), None), route, "{host}");
+        let dns_rule = config["dns"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| matches_output(rule, Some(host), None));
+        let actual = dns_rule.map_or(config["dns"]["final"].as_str().unwrap(), |rule| {
+            rule["server"]
+                .as_str()
+                .unwrap_or_else(|| rule["action"].as_str().unwrap())
+        });
+        assert_eq!(actual, dns, "{host}");
+    }
+
+    if let Some(binary) = std::env::var_os("SING_BOX") {
+        let output = run(
+            "binary.json",
+            &[
+                "--ruleset-format",
+                "srs",
+                "--sing-box",
+                binary.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for name in ["compiled.json", "binary.json"] {
+            let checked = Command::new(&binary)
+                .current_dir(project.0.path())
+                .args(["check", "-c", name])
+                .output()
+                .unwrap();
+            assert!(
+                checked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            let generated: Value =
+                serde_json::from_slice(&fs::read(project.0.path().join(name)).unwrap()).unwrap();
+            let tag = &generated["dns"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rule| rule["action"] == "reject")
+                .unwrap()["rule_set"][0];
+            let set = generated["route"]["rule_set"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|set| set["tag"] == *tag)
+                .unwrap();
+            let (format, path) = if name == "binary.json" {
+                ("binary", set["path"].as_str().unwrap())
+            } else {
+                project.write(
+                    "optimized-domain.json",
+                    &json!({"version":2,"rules":set["rules"]}).to_string(),
+                );
+                ("source", "optimized-domain.json")
+            };
+            for (host, expected) in [
+                ("safe.ads.example.com.", false),
+                ("x.safe.ads.example.com.", true),
+            ] {
+                let matched = Command::new(&binary)
+                    .current_dir(project.0.path())
+                    .args(["rule-set", "match", "--format", format, path, host])
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&matched.stderr);
+                assert!(matched.status.success(), "{stderr}");
+                assert_eq!(
+                    stderr.contains("match rules."),
+                    expected,
+                    "{format} {host}: {stderr}"
+                );
+            }
+        }
+    }
+}

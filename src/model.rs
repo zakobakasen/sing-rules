@@ -139,3 +139,33 @@ pub fn domain(text: &str) -> Result<String> {
     );
     Ok(name)
 }
+
+pub(crate) fn subtract_ip_prefix(range: IpNet, excluded: IpNet) -> Vec<IpNet> {
+    if excluded.contains(&range) {
+        return Vec::new();
+    }
+    if !range.contains(&excluded) {
+        return vec![range];
+    }
+    let mut result = Vec::new();
+    for len in range.prefix_len() + 1..=excluded.prefix_len() {
+        let sibling = match excluded {
+            IpNet::V4(net) => {
+                let address = u32::from(net.network()) ^ (1 << (32 - len));
+                IpNet::new(std::net::Ipv4Addr::from(address).into(), len)
+                    .unwrap()
+                    .trunc()
+            }
+            IpNet::V6(net) => {
+                let address = u128::from(net.network()) ^ (1 << (128 - len));
+                IpNet::new(std::net::Ipv6Addr::from(address).into(), len)
+                    .unwrap()
+                    .trunc()
+            }
+        };
+        if !mapped_network().contains(&sibling) {
+            result.push(sibling);
+        }
+    }
+    result
+}

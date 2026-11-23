@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use ipnet::{IpNet, Ipv6Net};
 use serde_json::{Map, Value, json};
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     net::Ipv6Addr,
@@ -18,7 +19,7 @@ struct Node<'a> {
 #[derive(Clone, Debug)]
 struct Layer<'a> {
     action: &'a str,
-    matchers: Vec<&'a Matcher>,
+    matchers: Vec<Cow<'a, Matcher>>,
 }
 
 pub enum BaseRules {
@@ -118,11 +119,12 @@ fn compile_route(
     let mut layers = domain_layers(table);
     let mut trailing_ip_layers = Vec::new();
     if needs_dns {
+        let mut ip = ip_layers(table);
+        if !prefix.iter().any(contains_resolve) {
+            ip = compact_ip_layers(ip);
+        }
         trailing_ip_layers = trailing_ip_layers_for_table(table, fallback);
-        for layer in ip_layers(table)
-            .into_iter()
-            .chain(trailing_ip_layers.iter().cloned())
-        {
+        for layer in ip.into_iter().chain(trailing_ip_layers.iter().cloned()) {
             push_layer(&mut layers, layer);
         }
     }
@@ -168,12 +170,47 @@ fn compile_route(
     Ok(prefix_len)
 }
 
+fn compact_ip_layers(layers: Vec<Layer<'_>>) -> Vec<Layer<'_>> {
+    let input = layers
+        .into_iter()
+        .map(|layer| crate::ip_opt::IpLayer {
+            action: layer.action,
+            networks: layer
+                .matchers
+                .iter()
+                .map(|matcher| match matcher.as_ref() {
+                    Matcher::Ip(net) => *net,
+                    _ => unreachable!("IP layers only contain CIDRs"),
+                })
+                .collect(),
+        })
+        .collect();
+    crate::ip_opt::compact(input)
+        .into_iter()
+        .map(|layer| Layer {
+            action: layer.action,
+            matchers: layer
+                .networks
+                .into_iter()
+                .map(|network| Cow::Owned(Matcher::Ip(network)))
+                .collect(),
+        })
+        .collect()
+}
+
+fn contains_resolve(rule: &Value) -> bool {
+    rule["action"] == "resolve"
+        || rule["rules"]
+            .as_array()
+            .is_some_and(|rules| rules.iter().any(contains_resolve))
+}
+
 fn trailing_ip_layers_for_table<'a>(table: &'a Table, fallback: &str) -> Vec<Layer<'a>> {
     let mut layers = Vec::new();
     if let Some(rule) = table.rules.get(&Matcher::PrivateIp) {
         layers.push(Layer {
             action: &rule.target,
-            matchers: vec![&Matcher::PrivateIp],
+            matchers: vec![Cow::Borrowed(&Matcher::PrivateIp)],
         });
     }
 
@@ -189,7 +226,7 @@ fn trailing_ip_layers_for_table<'a>(table: &'a Table, fallback: &str) -> Vec<Lay
                 &mut layers,
                 Layer {
                     action: &rule.target,
-                    matchers: vec![matcher],
+                    matchers: vec![Cow::Borrowed(matcher)],
                 },
             );
         }
@@ -221,7 +258,7 @@ fn resolved_ip_layers(table: &Table) -> Vec<Layer<'_>> {
             &mut layers,
             Layer {
                 action,
-                matchers: vec![matcher],
+                matchers: vec![Cow::Borrowed(matcher)],
             },
         );
     }
@@ -229,10 +266,13 @@ fn resolved_ip_layers(table: &Table) -> Vec<Layer<'_>> {
 }
 
 fn domain_layers(table: &Table) -> Vec<Layer<'_>> {
-    let mut regions: BTreeMap<&str, Vec<&Matcher>> = BTreeMap::new();
+    let mut regions: BTreeMap<&str, Vec<Cow<'_, Matcher>>> = BTreeMap::new();
     for (matcher, rule) in &table.rules {
         if matches!(matcher, Matcher::DomainRegion { .. }) {
-            regions.entry(&rule.target).or_default().push(matcher);
+            regions
+                .entry(&rule.target)
+                .or_default()
+                .push(Cow::Borrowed(matcher));
         }
     }
     if !regions.is_empty() {
@@ -286,7 +326,46 @@ fn domain_layers(table: &Table) -> Vec<Layer<'_>> {
             suffixes.insert((name, kind == 1), index);
         }
     }
-    schedule(nodes)
+    compact_domain_layers(schedule(nodes))
+}
+
+fn compact_domain_layers(mut layers: Vec<Layer<'_>>) -> Vec<Layer<'_>> {
+    let mut index = 0;
+    while index + 2 < layers.len() {
+        let [first, middle, last] = &layers[index..index + 3] else {
+            unreachable!()
+        };
+        let replacement = (first.action == last.action)
+            .then(|| {
+                let [a, b, c] = [first, middle, last]
+                    .map(|layer| layer.matchers.iter().map(|matcher| matcher.as_ref()));
+                let (carved, combined) = crate::domain_set::compact_exception(a, b, c)?;
+                let mut result = Vec::new();
+                if !carved.is_empty() {
+                    result.push(Layer {
+                        action: middle.action,
+                        matchers: carved.into_iter().map(Cow::Owned).collect(),
+                    });
+                }
+                result.push(Layer {
+                    action: first.action,
+                    matchers: combined.into_iter().map(Cow::Owned).collect(),
+                });
+                Some(result)
+            })
+            .flatten();
+        if let Some(replacement) = replacement {
+            layers.splice(index..index + 3, replacement);
+            index = index.saturating_sub(2);
+        } else {
+            index += 1;
+        }
+    }
+    let mut merged = Vec::new();
+    for layer in layers {
+        push_layer(&mut merged, layer);
+    }
+    merged
 }
 
 fn ip_layers(table: &Table) -> Vec<Layer<'_>> {
@@ -350,7 +429,7 @@ fn schedule(mut nodes: Vec<Node<'_>>) -> Vec<Layer<'_>> {
     while let Some((action, indices)) = ready.pop_first() {
         let mut matchers = Vec::with_capacity(indices.len());
         for index in indices {
-            matchers.push(nodes[index].matcher);
+            matchers.push(Cow::Borrowed(nodes[index].matcher));
             if let Some(parent) = nodes[index].parent {
                 nodes[parent].pending_children -= 1;
                 if nodes[parent].pending_children == 0 {
@@ -382,7 +461,7 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value
     let mut rule = Map::new();
     let mut branches = Vec::new();
     for matcher in layer.matchers {
-        match matcher {
+        match matcher.as_ref() {
             Matcher::Ip(IpNet::V4(net)) => {
                 ip.push(IpNet::V4(*net));
                 ip.push(model::ipv4_alias(*net));
@@ -433,6 +512,15 @@ fn emit(layer: Layer<'_>, multiple_addresses: bool, target_field: &str) -> Value
             Matcher::Any => unreachable!("global fallback is emitted separately"),
         }
     }
+    // An exact name and its descendants cover one inclusive suffix.
+    exact.retain(|name| {
+        if suffix.remove(&format!(".{name}")) {
+            suffix.insert(name.clone());
+            false
+        } else {
+            true
+        }
+    });
     for (field, value) in [
         ("ip_cidr", cidrs(ip)),
         ("domain", json!(exact)),

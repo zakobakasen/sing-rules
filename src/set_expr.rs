@@ -259,40 +259,10 @@ fn combine_ips(mut left: BTreeSet<IpNet>, right: BTreeSet<IpNet>, op: Op) -> BTr
             for excluded in right {
                 left = left
                     .into_iter()
-                    .flat_map(|range| subtract(range, excluded))
+                    .flat_map(|range| crate::model::subtract_ip_prefix(range, excluded))
                     .collect();
             }
             left
         }
     }
-}
-
-fn subtract(range: IpNet, excluded: IpNet) -> Vec<IpNet> {
-    if excluded.contains(&range) {
-        return Vec::new();
-    }
-    if !range.contains(&excluded) {
-        return vec![range];
-    }
-    let mut result = Vec::new();
-    for len in range.prefix_len() + 1..=excluded.prefix_len() {
-        let sibling = match excluded {
-            IpNet::V4(net) => {
-                let address = u32::from(net.network()) ^ (1 << (32 - len));
-                IpNet::new(std::net::Ipv4Addr::from(address).into(), len)
-                    .unwrap()
-                    .trunc()
-            }
-            IpNet::V6(net) => {
-                let address = u128::from(net.network()) ^ (1 << (128 - len));
-                IpNet::new(std::net::Ipv6Addr::from(address).into(), len)
-                    .unwrap()
-                    .trunc()
-            }
-        };
-        if !crate::model::mapped_network().contains(&sibling) {
-            result.push(sibling);
-        }
-    }
-    result
 }

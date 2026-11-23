@@ -111,6 +111,81 @@ pub fn combine(left: &DomainSet, right: &DomainSet, op: crate::set_expr::Op) -> 
         .collect()
 }
 
+// For A, B, A, put B first after subtracting the first A from B.
+// The two A layers can then use their union.
+pub(crate) fn compact_exception<'a>(
+    first: impl Iterator<Item = &'a Matcher>,
+    middle: impl Iterator<Item = &'a Matcher>,
+    last: impl Iterator<Item = &'a Matcher>,
+) -> Option<(Vec<Matcher>, Vec<Matcher>)> {
+    let first: Vec<_> = first.map(Scope::from_matcher).collect::<Option<_>>()?;
+    let middle: Vec<_> = middle.map(Scope::from_matcher).collect::<Option<_>>()?;
+    let last: Vec<_> = last.map(Scope::from_matcher).collect::<Option<_>>()?;
+    let budget = first.len() + middle.len() + last.len();
+
+    let first = minimal_union(first);
+    let combined = minimal_union(first.iter().cloned().chain(last));
+    let mut carved: BTreeMap<_, Vec<Scope>> = minimal_union(middle)
+        .into_iter()
+        .filter(|scope| !covered_by(&first, scope.clone()))
+        .map(|scope| (scope, Vec::new()))
+        .collect();
+    let mut cost = carved.len() + combined.len();
+    for scope in &first {
+        let mut parent = scope.parent();
+        while let Some(ancestor) = parent {
+            if let Some(holes) = carved.get_mut(&ancestor) {
+                cost += 1;
+                if cost > budget {
+                    return None;
+                }
+                holes.push(scope.clone());
+                break;
+            }
+            parent = ancestor.parent();
+        }
+    }
+
+    Some((
+        carved
+            .into_iter()
+            .map(|(scope, excluded)| {
+                if excluded.is_empty() {
+                    scope.matcher()
+                } else {
+                    Matcher::DomainRegion { scope, excluded }
+                }
+            })
+            .collect(),
+        combined.into_iter().map(|scope| scope.matcher()).collect(),
+    ))
+}
+
+fn minimal_union(scopes: impl IntoIterator<Item = Scope>) -> BTreeSet<Scope> {
+    let scopes: BTreeSet<_> = scopes.into_iter().collect();
+    scopes
+        .iter()
+        .filter(|scope| {
+            scope
+                .parent()
+                .is_none_or(|parent| !covered_by(&scopes, parent))
+        })
+        .cloned()
+        .collect()
+}
+
+fn covered_by(scopes: &BTreeSet<Scope>, mut scope: Scope) -> bool {
+    loop {
+        if scopes.contains(&scope) {
+            return true;
+        }
+        let Some(parent) = scope.parent() else {
+            return false;
+        };
+        scope = parent;
+    }
+}
+
 pub fn install(
     table: &mut Table,
     plain: BTreeMap<Scope, Vec<Rule>>,

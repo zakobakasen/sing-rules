@@ -1610,3 +1610,14 @@ fn generated_tags_keep_their_prefix_and_only_extend_on_collision() {
     assert_eq!(extended.len(), 2);
     assert_eq!(config["route"]["rules"][0]["rule_set"], json!([extended]));
 }
+
+#[test]
+fn rooted_and_unrooted_domain_inputs_produce_identical_inline_sets() {
+    let project = Project::new();
+    let plain = project.compile("", "a.example, Direct\n*.b.example, Direct\n*, Proxy");
+    let rooted = project.compile("", "*.B.EXAMPLE., Direct\nA.EXAMPLE., Direct\n*, Proxy");
+    assert_eq!(plain["route"]["rule_set"], rooted["route"]["rule_set"]);
+    let rules = &plain["route"]["rule_set"][0]["rules"][0];
+    assert_eq!(rules["domain"], json!(["a.example", "a.example."]));
+    assert_eq!(rules["domain_suffix"], json!([".b.example", ".b.example."]));
+}

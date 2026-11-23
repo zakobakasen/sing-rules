@@ -125,11 +125,32 @@ impl Registry {
         Ok(())
     }
 
-    fn register(&mut self, condition: Value) -> Result<usize> {
-        let source = json!({"version": 2, "rules": [condition]});
+    fn register(&mut self, mut condition: Value) -> Result<usize> {
+        condition.sort_all_objects();
+        normalize_matchers(&mut condition);
+        let mut source = json!({"version": 2, "rules": [condition]});
+        source.as_object_mut().unwrap().sort_keys();
         let bytes = serde_json::to_vec(&source)?;
         let next_id = self.by_content.len();
         Ok(*self.by_content.entry(bytes).or_insert(next_id))
+    }
+}
+
+// Only generated headless conditions reach this function. Destination
+// lists and the child predicates of AND/OR are unordered.
+fn normalize_matchers(condition: &mut Value) {
+    for field in ["domain", "domain_suffix", "ip_cidr"] {
+        if let Some(values) = condition.get_mut(field).and_then(Value::as_array_mut) {
+            values.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+            values.dedup();
+        }
+    }
+    if let Some(children) = condition.get_mut("rules").and_then(Value::as_array_mut) {
+        for child in children.iter_mut() {
+            normalize_matchers(child);
+        }
+        children.sort_by_cached_key(Value::to_string);
+        children.dedup();
     }
 }
 
@@ -202,4 +223,37 @@ fn export_srs(output: &Path, sing_box: &Path, source: &[u8], tag: &str) -> Resul
     staged.write_all(&bytes)?;
     staged.persist(directory.join(&filename))?;
     Ok(format!("sing-rules-srs/{filename}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_orderings_share_the_tag_input_and_inline_source() {
+        let ordered = json!({"type":"logical","mode":"or","rules":[
+            {"domain":["a.example","a.example.","b.example","b.example."]},
+            {"ip_cidr":["192.0.2.0/24","203.0.113.0/24"]}
+        ]});
+        let reordered = json!({"rules":[
+            {"ip_cidr":["203.0.113.0/24","192.0.2.0/24"]},
+            {"domain":["b.example.","a.example.","b.example","a.example","a.example"]}
+        ],"mode":"or","type":"logical"});
+        let mut registry = Registry::default();
+        assert_eq!(
+            registry.register(ordered).unwrap(),
+            registry.register(reordered).unwrap()
+        );
+        let (bytes, _) = registry.by_content.first_key_value().unwrap();
+        let source: Value = serde_json::from_slice(bytes).unwrap();
+        let children = source["rules"][0]["rules"].as_array().unwrap();
+        assert_eq!(
+            children[0]["domain"],
+            json!(["a.example", "a.example.", "b.example", "b.example."])
+        );
+        assert_eq!(
+            children[1]["ip_cidr"],
+            json!(["192.0.2.0/24", "203.0.113.0/24"])
+        );
+    }
 }

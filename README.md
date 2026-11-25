@@ -1,21 +1,130 @@
-# Sing-Rules
+# sing-rules
 
-自用的八音盒规则集
+将按匹配范围决定优先级的路由表编译成 sing-box JSON。支持一张路由表，以及一张可选的 DNS 表。
 
-## mine 文件夹
+```text
+ruleset cn-ip = url("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.json")
+ruleset cn = file("./rules/cn-domains.json")
+ruleset ads = file("./rules/ads.json")
 
-该文件夹下是所有由我决定源站部署位置的网站，每个文件里都有域名和 IP 规则。
+outbounds {
+    Proxy
+    Direct
+    Aliyun
+}
 
-其中，`all` 是所有的网站和 IP，`CNopt` 指服务器不在大陆但大陆大多数地区访问较快（TLS 握手全国平均一秒内完成）
+route {
+    IP, 1.1.1.1/32, Proxy
+    2001:db8::1, Direct
+    a.com, Direct
+    *.a.com, Aliyun
+    RuleSet, cn, Aliyun
+    RuleSet, cn-ip, Direct
+    RuleSet, ads, Reject, 100
+    RuleSet, PrivateIP, Direct
+    *, Proxy
+}
 
-剩下的是按国家分的。
+dns-server {
+    local-dns
+    remote-dns
+}
 
-在这个目录下，任何一个文件所对应的集合，都是 `all` 文件所对应的集合的子集，除此之外，`all` 也包含了其他集合中不存在的元素。
+dns {
+    RuleSet, ads, Reject, 100
+    RuleSet, cn, local-dns
+    *.example.com, remote-dns
+    *, remote-dns
+}
+```
 
-具体地说，就是，任何一个非 `all` 能匹配上的规则，一定能被 `all` 匹配，但 `all` 能匹配上的，不一定能被非 `all` 规则匹配（就算你把所有非 `all` 做或运算）
+## 编译
 
----
+```sh
+cargo run --locked -- compile routes.rules --base sing-box.json -o compiled.json
+sing-box check -c compiled.json
+```
 
-## 以后
+基础配置提供入站、出站和 DNS 等配置。 `outbounds` 块声明表可以引用的出站标签，名称与基础配置的 `tag` 一致。 `Reject` 是内置动作。省略 `-o` 时输出到标准输出。基础配置已有 `route.rules` 时，使用 `--base-rules-first` 将它们按原顺序放在生成规则之前，或使用 `--replace-route` 替换它们。两项互斥。 `route.final` 由 DSL 的全局兜底决定，其他基础配置字段会保留。
 
-可能会编写 action 维护一些其他的规则集。
+例如，要先将 53 端口的请求交给 sing-box 的 DNS 模块，在基础配置中写入以下原生规则，并在编译时加 `--base-rules-first`。
+
+```json
+{
+  "route": {
+    "rules": [
+      { "port": [53], "action": "hijack-dns" }
+    ]
+  }
+}
+```
+
+## 语法和优先级
+
+- 一行一个匹配项，格式为 `[类型,] 匹配内容, 目标[, 优先级]`。可显式写 `IP`、`Domain`、`DomainSuffix`、`RuleSet` 或 `Any`。规则集写成 `RuleSet, 名称, 目标[, 优先级]`。
+- 裸地址分别按 IPv4 `/32` 和 IPv6 `/128` 处理。同一前缀或域名范围的多个候选中，最高优先级的动作胜出。最高优先级相同但动作不同时会报冲突。
+- `a.com` 精确匹配根域名，`*.a.com` 匹配任意深度的子域名。域名按 DNS 标签边界匹配，书写时可使用大写、根点和 IDNA 域名。
+- 先匹配最具体的域名，再尝试已有的目标 IP。IP 阶段依次使用非 `/0` 的最长 CIDR、`PrivateIP`、对应 IP 家族的 `/0`，最后使用必填的全局 `*`。
+- 当表里有可影响选路的 IP 条件时，只有域名且第一轮未命中的连接会执行 sing-box 的 `resolve`，随后只匹配 IP 条件。已有目标 IP 的连接在第一轮选定动作。解析使用 sing-box 的 DNS 配置，解析出错时由 sing-box 结束该连接。
+- DNS 返回多个地址时，具体 CIDR 按原始前缀长度从长到短匹配任一地址。相同长度优先 `Reject`，其他动作按出站标签排序。若两族的 `/0` 都匹配，IPv4 的 `/0` 优先。
+- `RuleSet, PrivateIP, Direct` 直接使用 sing-box 的 `ip_is_private`，继承运行版本对非公网地址的定义。
+
+已知目标 IP 的阶段会尝试合并夹着例外的同出站规则，以及用已先匹配的范围填补后置 CIDR 的缺口。这些局部改写只在能精简该阶段的规则或 CIDR 时采用。基础配置含前置 `resolve` 时跳过该优化，DNS 解析后的多地址匹配保持原有顺序。
+
+同一规则里的精确根域名和通配子域名会合并为一个包含根域名的后缀。路由和 DNS 表内遇到嵌套的同目标规则时，如果不增加域名匹配项数量，编译器可以改写中间规则的排除条件以减少执行规则。
+
+## DNS
+
+`dns-server` 声明可在 `dns` 块中引用的服务器标签。它们必须存在于基础配置的 `dns.servers` 中。 `dns` 块生成 `dns.rules`，必填的 `*` 指向一个服务器并生成 `dns.final`。非兜底规则可用 `Reject`。
+
+DNS 只匹配查询域名。导入 RuleSet 时，先剔除 IP 条目，再判断优先级和冲突。纯 IP 规则集和 `PrivateIP` 会在 DNS 表中警告并跳过。手写 IP 条目会报错。
+
+出现 `dns` 块时，它替换基础配置的 `dns.rules` 和 `dns.final`，保留服务器定义和其他 DNS 设置。省略 `dns` 块时沿用基础配置的 DNS。 `--base-rules-first` 与 `--replace-route` 只作用于 `route.rules`。
+
+旧版配置请将 `outbound` 改为 `outbounds`，将 `table default` 改为 `route`，将 `REJECT` 改为 `Reject`。第四列改用裸整数，并按数字越小越优先的规则重新选择数值。
+
+## 规则集
+
+用户定义的规则集名称匹配 `[A-Za-z0-9._~-]+`，区分大小写。 `file(...)` 的相对路径以 DSL 源文件所在目录为基准。 `url(...)` 在编译时下载源文件。
+
+支持 sing-box JSON 规则集版本 1 至 5，以及可由本地 sing-box 反编译的 SRS 版本 2 至 5。使用 `--sing-box /path/to/sing-box` 可指定反编译程序。规则集中的目标域名、域名后缀、IP 和由这些条件构成的逻辑 OR 可以展开。遇到 `domain_regex`、`port` 等其他字段时，编译器向标准错误输出警告，并继续导入同一条规则里的目标域名、域名后缀和 IP。因此省略端口一类的限制后，保留的匹配项会适用于更广的流量。逻辑 AND 和取反会警告并跳过整条规则。支持字段的值格式错误或导入了带旧版后缀语义的 SRS 版本 1 时，编译会报错。导入项和手写规则共享优先级，输出把编译后的条件写入 `route.rule_set`，由路由规则和 DNS 规则通过标签引用。
+
+普通规则和 RuleSet 引用都可在最后一列填写优先级，例如 `example.com, Direct, 100` 或 `RuleSet, ads, Reject, 100`。优先级为有符号 64 位整数，数字越小越优先，省略时取 `32766`。优先级只用于解决完全相同的匹配范围。更具体的域名或 CIDR 仍先匹配，改变行顺序不会改变结果。
+
+### 集合运算
+
+```text
+ruleset ads = file("./rules/ads.json")
+ruleset trackers = file("./rules/trackers.json")
+ruleset allowlist = file("./rules/allowlist.json")
+ruleset blocked = (ads + trackers) - allowlist
+ruleset common = ads * trackers
+```
+
+`+` 是并集，`-` 是差集，`*` 是交集。括号先算，`*` 次之，`+` 与 `-` 同级且从左往右结合。规则集名称允许连字符，所以用空格隔开差号，例如 `a - b`。声明可以向前引用，循环和未知名称会报错。
+
+域名与 IP 分别做集合运算。域名差集使用精确的排除条件，被排除的域名继续匹配其他规则或兜底。IP 差集拆分成等价的 CIDR，结果前缀按现有最长前缀规则参与路由。 `PrivateIP` 继续通过独立的 `RuleSet, PrivateIP, 出站` 引用。
+
+### 规则集输出
+
+默认使用 `--ruleset-format inline`，把数据保存在生成配置的 `route.rule_set` 中。指定 `--ruleset-format srs` 时，必须同时指定 `-o`。编译器会调用 `--sing-box` 指定的程序，在配置旁的 `sing-rules-srs/` 目录写入 SRS 文件。文件名是实际 SRS 内容的 256 位 BLAKE3 摘要，经无填充 Base64URL 编码后加上 `.srs`。部署时把该目录与配置一起复制，并从配置所在目录运行 sing-box，或用 `sing-box -D <目录> -c <配置>` 指定工作目录。
+
+生成的规则集使用内容派生的短标签，内联与 SRS 共用分配方式。生成的匹配条件先统一对象键、域名与 CIDR 列表、AND/OR 子条件的顺序，并去掉列表中的重复项，再用于生成标签、内联和 SRS。域名输入统一去掉根点，输出同时包含带点与不带点的形式，以兼容 sing-box 的实际匹配。相同条件复用标签。标签从 BLAKE3 输出流经拒绝采样得到的 `A–Z`、`a–z`、`0–9` 序列取前缀，从一字符开始。只有发生碰撞的标签才会逐字符延长，基础配置占用的标签原样保留。
+
+规则集不包含 `ip_is_private`。只匹配 `PrivateIP` 时直接生成原生路由条件。同一动作同时匹配规则集和 `PrivateIP` 时，用显式逻辑 OR 连接两者。DNS 规则仅引用域名规则集。
+
+### 远程规则集缓存
+
+`url(...)` 按 URL 缓存已成功解析的下载文件，24 小时内重复编译可直接复用。同一个 URL 用多个规则集名称引用时也共用缓存。缓存过期时重新下载，刷新失败会报错，旧文件仍保留。 `file(...)` 每次编译读取本地文件。
+
+Windows 默认目录为 `%LOCALAPPDATA%/sing-rules/cache/rulesets`，macOS 为 `~/Library/Caches/sing-rules/rulesets`，Linux 为 `$XDG_CACHE_HOME/sing-rules/rulesets` 或 `~/.cache/sing-rules/rulesets`。使用 `--cache-dir <目录>` 指定其他路径，使用 `--refresh` 跳过缓存并重新下载。
+
+## 测试
+
+```sh
+cargo test --locked
+SING_BOX=/path/to/sing-box cargo test --locked
+SING_BOX_RUNTIME=/path/to/sing-box cargo test --locked verifies_real_routing -- --ignored
+```
+
+`SING_BOX` 启用真实二进制的配置检查、匹配和 SRS 测试。 `SING_BOX_RUNTIME` 启用需要启动 sing-box 并监听本地端口的 SOCKS 连接测试。

@@ -1,0 +1,32 @@
+name: Server
+on:
+  push:
+    branches: [server-sqlite]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: cargo +stable test --workspace --locked
+      - run: cargo +stable build --locked --release -p sing-rules-server
+      - if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/qa"
+          "$RUNNER_TEMP/qa/bin/pip" install cryptography
+          curl -fsSL --retry 3 https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          export SING_BOX="$RUNNER_TEMP/sing-box-1.14.4-linux-amd64/sing-box"
+          export SING_RULES_SERVER="$PWD/target/release/sing-rules-server"
+          "$RUNNER_TEMP/qa/bin/python" -m unittest discover -s server/tests -p '*.py'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-rules-server-${{ runner.os }}-x64
+          path: |
+            target/release/sing-rules-server
+            target/release/sing-rules-server.exe
+          if-no-files-found: error

@@ -11,6 +11,10 @@ use std::{
 
 pub enum Format<'a> {
     Inline,
+    Remote {
+        public_url: &'a str,
+        files: &'a mut BTreeMap<String, Vec<u8>>,
+    },
     Srs {
         output: &'a Path,
         sing_box: &'a Path,
@@ -21,7 +25,7 @@ pub fn export(
     base: &mut Value,
     route_prefix: usize,
     has_dns: bool,
-    format: Format<'_>,
+    mut format: Format<'_>,
 ) -> Result<()> {
     let existing = base["route"].as_object_mut().unwrap().remove("rule_set");
     let had_sets = existing.is_some();
@@ -53,9 +57,25 @@ pub fn export(
         }
     }
     let mut tag_by_id = vec![String::new(); registry.by_content.len()];
-    let tags = crate::tags::allocate(registry.by_content.keys().map(Vec::as_slice), &used);
-    for ((bytes, id), tag) in registry.by_content.into_iter().zip(tags) {
-        let set = match format {
+    let tags = if matches!(&format, Format::Remote { .. }) {
+        vec![String::new(); registry.by_content.len()]
+    } else {
+        crate::tags::allocate(registry.by_content.keys().map(Vec::as_slice), &used)
+    };
+    for ((bytes, id), mut tag) in registry.by_content.into_iter().zip(tags) {
+        let set = match &mut format {
+            Format::Remote { public_url, files } => {
+                let source: Value = serde_json::from_slice(&bytes)?;
+                let data = crate::srs::encode(&source)?;
+                tag = URL_SAFE_NO_PAD.encode(blake3::hash(&data).as_bytes());
+                ensure!(
+                    !used.contains(&tag),
+                    "generated SRS tag conflicts with base tag {tag}"
+                );
+                let url = format!("{}/srs/{tag}.srs", public_url.trim_end_matches('/'));
+                files.insert(tag.clone(), data);
+                json!({"type":"remote","format":"binary","tag":tag,"url":url})
+            }
             Format::Inline => {
                 let source: Value = serde_json::from_slice(&bytes)?;
                 json!({"type":"inline", "tag":tag, "rules":source["rules"]})

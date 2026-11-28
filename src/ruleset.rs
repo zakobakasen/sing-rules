@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{fs, path::Path, process::Command, time::Duration};
 
-fn web_agent(url: &str) -> Result<ureq::Agent> {
+fn web_agent(url: &str, hosted: bool) -> Result<ureq::Agent> {
     let scheme_variables = if url.starts_with("https://") {
         ["https_proxy", "HTTPS_PROXY"]
     } else {
@@ -39,6 +39,7 @@ fn web_agent(url: &str) -> Result<ureq::Agent> {
         .or_else(ureq::Proxy::try_from_env);
 
     Ok(ureq::Agent::config_builder()
+        .max_redirects(if hosted { 0 } else { 10 })
         .proxy(proxy)
         .timeout_global(Some(Duration::from_secs(60)))
         .tls_config(
@@ -80,6 +81,12 @@ pub fn load(
     sing_box: &Path,
     cache: &Cache,
 ) -> Result<Vec<(Matcher, String)>> {
+    if let Some(urls) = &cache.allowed_urls {
+        ensure!(
+            matches!(source, Source::Url(url) if urls.contains(url)),
+            "import is not on the server URL allowlist"
+        );
+    }
     let url = match source {
         Source::File(path) => {
             let path = directory.join(path);
@@ -102,7 +109,7 @@ pub fn load(
         }
     }
 
-    let mut response = web_agent(url)?
+    let mut response = web_agent(url, cache.allowed_urls.is_some())?
         .get(url)
         .call()
         .with_context(|| format!("fetching {url}"))?;

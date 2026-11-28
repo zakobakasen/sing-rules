@@ -10,6 +10,7 @@ pub const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct Cache {
+    pub allowed_urls: Option<Vec<String>>,
     directory: Option<PathBuf>,
     refresh: bool,
 }
@@ -17,8 +18,17 @@ pub struct Cache {
 impl Cache {
     pub fn new(directory: Option<PathBuf>, refresh: bool) -> Self {
         Self {
+            allowed_urls: None,
             directory: directory.or_else(default_directory),
             refresh,
+        }
+    }
+
+    pub fn service(urls: Vec<String>) -> Self {
+        Self {
+            directory: None,
+            refresh: false,
+            allowed_urls: Some(urls),
         }
     }
 

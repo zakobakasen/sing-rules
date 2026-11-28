@@ -1,13 +1,4 @@
-mod cache;
-mod compiler;
-mod domain_set;
-mod export;
-mod ip_opt;
-mod model;
-mod parser;
-mod ruleset;
-mod set_expr;
-mod tags;
+use sing_rules::{cache, compiler, export, parser};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};

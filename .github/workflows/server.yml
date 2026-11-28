@@ -18,11 +18,12 @@ jobs:
       - if: runner.os == 'Linux'
         run: |
           python3 -m venv "$RUNNER_TEMP/qa"
-          "$RUNNER_TEMP/qa/bin/pip" install cryptography
+          "$RUNNER_TEMP/qa/bin/pip" install cryptography playwright
           curl -fsSL --retry 3 https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           export SING_BOX="$RUNNER_TEMP/sing-box-1.14.4-linux-amd64/sing-box"
           export SING_RULES_SERVER="$PWD/target/release/sing-rules-server"
           "$RUNNER_TEMP/qa/bin/python" -m unittest discover -s server/tests -p '*.py'
+          CHROME_BIN="$(command -v google-chrome)" "$RUNNER_TEMP/qa/bin/python" server/tests/browser.py
       - uses: actions/upload-artifact@v4
         with:
           name: sing-rules-server-${{ runner.os }}-x64

@@ -67,6 +67,11 @@ async fn api(
     .await;
     let response = match result {
         Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) if e.is::<identity::TokenError>() => {
+            let t=e.downcast_ref::<identity::TokenError>().unwrap();
+            (StatusCode::UNAUTHORIZED, Json(json!({"error":t.to_string(),"code":t.code,
+                "field":t.field,"actual":t.actual,"expected":t.expected})))
+        }
         Ok(Err(e)) => {
             let msg = e.to_string();
             let status = match msg.as_str() {
@@ -133,7 +138,7 @@ async fn main() -> Result<()> {
         store::connection(&db)?
             .query_row("select listen from settings where id=1", [], |r| r.get(0))?;
     let app=Router::new()
-        .route("/",get(||async{([(header::CACHE_CONTROL,"no-store"),(header::REFERRER_POLICY,"no-referrer"),(header::CONTENT_SECURITY_POLICY,"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")],Html(include_str!("index.html")))}))
+        .route("/",get(||async{([(header::CACHE_CONTROL,"no-store"),(header::REFERRER_POLICY,"no-referrer"),(header::CONTENT_SECURITY_POLICY,"default-src 'self'; connect-src 'self' https:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")],Html(include_str!("index.html")))}))
         .route("/app.js",get(||async{([(header::CONTENT_TYPE,"application/javascript")],include_str!("app.js"))}))
         .route("/style.css",get(||async{([(header::CONTENT_TYPE,"text/css")],include_str!("style.css"))}))
         .route("/api/{op}",post(api))

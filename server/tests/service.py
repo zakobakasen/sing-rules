@@ -63,12 +63,6 @@ class Idp:
                     n=idp.key.public_key().public_numbers().n
                     self.reply({"keys":[dict(kty="RSA",kid="key",alg="RS256",e="AQAB",n=b64(n.to_bytes((n.bit_length()+7)//8,"big")))]})
                 else:self.send_error(404)
-            def do_POST(self):
-                from urllib.parse import parse_qs
-                form=parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
-                if self.path=="/token" and form["client_id"]==["client"] and form["code_verifier"]==["v"*43] and form["code"]==["test-code"]:
-                    self.reply({"access_token":idp.jwt()})
-                else:self.send_error(400)
         self.key_reads=0
         self.server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Handler)
         self.url="https://localhost:"+str(self.server.server_port)
@@ -121,13 +115,20 @@ class Service(unittest.TestCase):
     def test_auth(self):
         self.api("me",status=401)
         meta=self.api("provider")
-        at=self.api("exchange",dict(code="test-code",verifier="v"*43,epoch=meta["epoch"]))["token"]
+        self.assertEqual(meta["token_endpoint"],self.idp.url+"/token")
+        self.api("exchange",status=401)
+        at=self.idp.jwt()
         guest="Bearer "+at
         me=self.api("me",auth=guest)
         self.assertEqual((me["role"],me["sub"]),("guest","new-user"))
         self.api("list",auth=guest,status=403)
         for patch in [dict(aud="wrong"),dict(client_id="wrong"),dict(iss="wrong"),dict(typ="JWT"),dict(exp=0),dict(nbf=int(time.time())+1000)]:
-            self.api("me",auth="Bearer "+self.idp.jwt(**patch),status=401)
+            error=self.api("me",auth="Bearer "+self.idp.jwt(**patch),status=401)
+            field=next(iter(patch))
+            self.assertEqual(error["field"],field)
+            self.assertIn(str(patch[field]),error["actual"])
+            self.assertIn(error["expected"],error["error"])
+            self.assertEqual(error["code"],"token_expired" if field=="exp" else "invalid_token")
         self.assertEqual(self.idp.key_reads,1)
         self.api("purge-keys",auth=self.local)
         self.api("me",auth=guest)

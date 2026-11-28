@@ -13,7 +13,7 @@ sing-rules-server serve --db rules.db
 
 ## 身份
 
-先用管理员密码进入「服务设置」。公开访问地址填浏览器和订阅客户端均可访问的源（如 `https://rules.example.com`）。公网部署由反向代理提供 HTTPS。将这个源加上末尾的 `/` 登记为 IdP 的回调地址。WebUI 使用公共客户端、授权码和 PKCE S256，令牌端点需允许无客户端密钥的代码交换。
+先用管理员密码进入「服务设置」。公开访问地址填浏览器和订阅客户端均可访问的源（如 `https://rules.example.com`）。公网部署由反向代理提供 HTTPS。将这个源加上末尾的 `/` 登记为 IdP 的回调地址。WebUI 使用公共客户端、授权码和 PKCE S256，浏览器直接向 IdP 的 token endpoint 交换授权码和刷新令牌。请在 IdP 启用公共客户端的授权码及刷新授权，允许 WebUI 的 origin 跨域调用令牌端点，并按 IdP 要求设置获取 RT 的 scope。AT 和 RT 保存在当前标签页的 sessionStorage，刷新页面后继续使用。应用 API 只接收 AT。IdP 撤销 RT 后，下次刷新需要重新登录；已签发的 AT 在有效期内仍可通过本地验签。
 
 在设置里填 issuer、client ID、资源标识和可选 scope。带资源标识的授权请求使用 RFC 8707 的 `resource` 参数。服务端按 issuer 发现公钥，同时验证访问令牌签名、类型、有效期、aud 和 client_id。首次通过 IdP 登录后，访客可以在「我的身份」复制自己的 sub。管理员在「身份授权」给当前 issuer 下的 sub 分配权限。可在另一个浏览器窗口验证 IdP 管理员已能进入「服务设置」，然后删除初始密码，所有密码会话随即失效。紧急轮换时，管理员可清除发现文档和公钥缓存。
 

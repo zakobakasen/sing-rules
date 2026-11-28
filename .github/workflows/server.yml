@@ -13,6 +13,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - run: node --test server/tests/oauth.cjs
       - run: rustup update stable
       - run: cargo +stable test --workspace --locked
       - run: cargo +stable build --locked --release -p sing-rules-server

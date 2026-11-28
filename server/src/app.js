@@ -25,12 +25,67 @@ function button(text, fn) { const b = node("button",text); b.type="button"; b.on
 function section(id) {
   for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== id;
 }
+function federated() {
+  return JSON.parse(sessionStorage.getItem("oauth") || "null");
+}
+function forgetLogin() {
+  sessionStorage.removeItem("oauth");
+  sessionStorage.removeItem("auth");
+  $("nav").replaceChildren();
+  section("login");
+}
+async function idpTokens(provider, grant, previousRefresh) {
+  const response = await fetch(provider.token_endpoint, {
+    method:"POST", credentials:"omit", redirect:"error", cache:"no-store", referrerPolicy:"no-referrer",
+    body:new URLSearchParams({client_id:provider.client, ...grant})
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const error = new Error(data.error_description || data.error || "IdP 令牌请求失败");
+    error.oauth = data.error;
+    throw error;
+  }
+  const refreshToken = data.refresh_token ?? previousRefresh;
+  if (data.token_type?.toLowerCase() !== "bearer" || !data.access_token || !refreshToken)
+    throw new Error("IdP 需要为此公共客户端签发 Bearer AT 和 RT，请检查授权范围和刷新设置");
+  const expires = Number.isFinite(data.expires_in) ? Date.now()+1000*data.expires_in : null;
+  return {provider, access:data.access_token, refresh:refreshToken, expires};
+}
+let refreshing;
+async function renew(session) {
+  if (!refreshing) {
+    const original = sessionStorage.getItem("oauth");
+    refreshing = idpTokens(session.provider, {grant_type:"refresh_token", refresh_token:session.refresh}, session.refresh)
+      .then(next => {
+        if (sessionStorage.getItem("oauth") !== original) throw new Error("登录状态已更改");
+        sessionStorage.setItem("oauth", JSON.stringify(next));
+        return next;
+      }).catch(error => {
+        if (error.oauth === "invalid_grant" && sessionStorage.getItem("oauth") === original) forgetLogin();
+        throw error;
+      }).finally(() => { refreshing = undefined; });
+  }
+  return refreshing;
+}
 async function api(op, data={}) {
-  const headers = {"Content-Type":"application/json"};
-  const auth = sessionStorage.getItem("auth");
-  if (auth) headers.Authorization = auth;
-  const response = await fetch("/api/"+op,{method:"POST",headers,body:JSON.stringify(data),cache:"no-store"});
-  if (response.status===401) {sessionStorage.removeItem("auth"); $("nav").replaceChildren(); section("login");}
+  const protectedOp = !["provider","login"].includes(op);
+  let session = protectedOp && federated();
+  if (session && session.expires !== null && session.expires <= Date.now()) session = await renew(session);
+  const send = (auth) => fetch("/api/"+op, {method:"POST", cache:"no-store",
+    headers:auth ? {"Content-Type":"application/json",Authorization:auth} : {"Content-Type":"application/json"},
+    body:JSON.stringify(data)});
+  let response = await send(session ? "Bearer "+session.access : protectedOp && sessionStorage.getItem("auth"));
+  const failure = response.status === 401 ? await response.clone().json().catch(()=>({})) : {};
+  if (failure.code === "token_expired" && session) {
+    const current = federated();
+    if (current) {
+      let next;
+      try {next = current.access === session.access ? await renew(current) : current;}
+      catch (error) {throw new Error(failure.error+"；IdP 刷新失败："+error.message);}
+      response = await send("Bearer "+next.access);
+    }
+  }
+  if (response.status === 401 && protectedOp) forgetLogin();
   const result = await response.json().catch(()=>({error:"HTTP "+response.status}));
   if (!response.ok) throw new Error(result.error);
   return result;
@@ -50,11 +105,13 @@ click("idp",async()=>{
   const params={response_type:"code",client_id:p.client_id??p.client,redirect_uri:p.redirect,resource:p.audience,
     state,code_challenge:challenge,code_challenge_method:"S256"};
   if(p.scope) params.scope=p.scope;
+  if(p.fragment) params.response_mode="fragment";
   for(const [key,val] of Object.entries(params)) url.searchParams.set(key,val);
   location.assign(url);
 });
 async function callback() {
-  const q=new URLSearchParams(location.search);
+  const fragment=new URLSearchParams(location.hash.slice(1));
+  const q=fragment.has("code") || fragment.has("error") ? fragment : new URLSearchParams(location.search);
   if(!q.has("code") && !q.has("error")) return;
   history.replaceState(null,"","/");
   const pending=JSON.parse(sessionStorage.getItem("pending")??"null");
@@ -62,18 +119,23 @@ async function callback() {
   if (!pending || !pending.state || pending.state!==q.get("state") || (q.has("iss")&&q.get("iss")!==pending.issuer))
     throw new Error("登录回调与当前请求不符，请重新登录");
   if(q.has("error")) throw new Error(q.get("error_description")||q.get("error"));
-  const r=await api("exchange",{code:q.get("code"),verifier:pending.verifier,epoch:pending.epoch});
-  sessionStorage.setItem("auth","Bearer "+r.token);
+  const p=await api("provider");
+  if (!p || p.issuer!==pending.issuer || p.epoch!==pending.epoch) throw new Error("身份提供商已更改，请重新登录");
+  const session=await idpTokens(p,{grant_type:"authorization_code",code:q.get("code"),
+    code_verifier:pending.verifier,redirect_uri:p.redirect});
+  sessionStorage.removeItem("auth");
+  sessionStorage.setItem("oauth",JSON.stringify(session));
 }
 submit("local",async()=>{
   const r=await api("login",fields($("local")));
-  $("local").reset(); sessionStorage.setItem("auth","Local "+r.token); await home();
+  $("local").reset(); sessionStorage.removeItem("oauth"); sessionStorage.setItem("auth","Local "+r.token); await home();
 });
 async function logout() {
-  try {await api("logout");} finally {sessionStorage.removeItem("auth");location.replace("/");}
+  try {if (sessionStorage.getItem("auth")?.startsWith("Local ")) await api("logout");}
+  finally {forgetLogin(); location.replace("/");}
 }
 async function home() {
-  if(!sessionStorage.getItem("auth")){section("login");return;}
+  if(!federated() && !sessionStorage.getItem("auth")){section("login");return;}
   me=await api("me");
   const nav=$("nav"); nav.replaceChildren(button("我的身份",()=>section("profile")));
   if(me.role!=="guest") nav.append(button("配置文件",async()=>{await refresh();section("configs");}),button("发布链接",async()=>{await refresh();section("links");}));

@@ -1,5 +1,6 @@
 use crate::store::{Settings, now};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
@@ -10,6 +11,61 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 use url::Url;
+
+#[derive(Debug)]
+pub struct TokenError {
+    pub field: &'static str,
+    pub actual: String,
+    pub expected: String,
+    pub code: &'static str,
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "访问令牌的 {} 校验失败。实际值为 {}，预期为 {}", self.field, self.actual, self.expected)
+    }
+}
+impl std::error::Error for TokenError {}
+
+fn invalid(field: &'static str, actual: impl Into<String>, expected: impl Into<String>) -> TokenError {
+    TokenError {field, actual:actual.into(), expected:expected.into(), code:"invalid_token"}
+}
+
+fn observed(value: Option<&Value>) -> String {
+    value.map(Value::to_string).unwrap_or_else(||"（缺失）".into())
+}
+
+fn claims(c: &Value, s: &Settings) -> Result<String> {
+    let current=now();
+    for (field, expected) in [("iss",&s.issuer), ("client_id",&s.client)] {
+        if c[field].as_str()!=Some(expected.as_str()) {
+            return Err(invalid(field, observed(c.get(field)), expected).into())
+        }
+    }
+    let aud=&c["aud"];
+    if !(aud.as_str()==Some(s.audience.as_str()) || aud.as_array().is_some_and(|a|
+        a.iter().all(Value::is_string) && a.iter().any(|v|v.as_str()==Some(s.audience.as_str())))) {
+        return Err(invalid("aud",observed(c.get("aud")),format!("{} 或包含该值的字符串数组",s.audience)).into())
+    }
+    for field in ["sub","jti"] {
+        if !c[field].as_str().is_some_and(|s|!s.is_empty()) {
+            return Err(invalid(field,observed(c.get(field)),"非空字符串").into())
+        }
+    }
+    for field in ["iat","nbf","exp"] {
+        if field=="nbf" && c.get(field).is_none(){continue}
+        let timestamp=c[field].as_i64().ok_or_else(||invalid(field,observed(c.get(field)),"Unix 时间戳（整数秒）"))?;
+        if field=="exp" && timestamp<current-1 {
+            let mut error=invalid(field,timestamp.to_string(),format!("不早于 {}（服务器 Unix 时间 {}，允许 1 秒偏差）",current-1,current));
+            error.code="token_expired";
+            return Err(error.into())
+        }
+        if field!="exp" && timestamp>current+1 {
+            return Err(invalid(field,timestamp.to_string(),format!("不晚于 {}（服务器 Unix 时间 {}，允许 1 秒偏差）",current+1,current)).into())
+        }
+    }
+    Ok(c["sub"].as_str().unwrap().to_owned())
+}
 
 pub fn endpoint(raw: &str) -> Result<Url> {
     let u = Url::parse(raw)?;
@@ -115,98 +171,61 @@ impl Discovery {
         Ok(m)
     }
     pub fn verify(&self, s: &Settings, token: &str) -> Result<String> {
-        let h = decode_header(token)?;
-        ensure!(
-            h.typ
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("at+jwt")
-                    || t.eq_ignore_ascii_case("application/at+jwt")),
-            "expected access token"
-        );
-        ensure!(
-            matches!(
-                h.alg,
-                Algorithm::RS256
-                    | Algorithm::RS384
-                    | Algorithm::RS512
-                    | Algorithm::PS256
-                    | Algorithm::PS384
-                    | Algorithm::PS512
-                    | Algorithm::ES256
-                    | Algorithm::ES384
-                    | Algorithm::EdDSA
-            ),
-            "asymmetric access token required"
-        );
-        let m = self.metadata(s)?;
-        let keys = self.get(s.epoch, m["jwks_uri"].as_str().context("missing jwks_uri")?)?;
-        let mut v = Validation::new(h.alg);
-        v.set_issuer(&[&s.issuer]);
-        v.set_audience(&[&s.audience]);
-        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        v.validate_nbf = true;
-        v.leeway = 1;
-        for k in keys["keys"].as_array().context("invalid JWKS")? {
-            if h.kid
-                .as_ref()
-                .is_some_and(|kid| k["kid"].as_str() != Some(kid.as_str()))
-                || k["use"].as_str().is_some_and(|u| u != "sig")
-                || k["key_ops"]
-                    .as_array()
-                    .is_some_and(|ops| !ops.iter().any(|v| v == "verify"))
-                || k["alg"]
-                    .as_str()
-                    .is_some_and(|a| a != format!("{:?}", h.alg))
-            {
-                continue;
+        let h = decode_header(token).map_err(|_| {
+            let mut parts=token.split('.');
+            let encoded=parts.next().unwrap_or("");
+            if parts.count()!=2 {
+                return invalid("JWT","段数错误","header.payload.signature 三段");
             }
-            let jwk: Jwk = match serde_json::from_value(k.clone()) {
-                Ok(k) => k,
-                Err(_) => continue,
-            };
-            let Ok(key) = DecodingKey::from_jwk(&jwk) else {
-                continue;
-            };
-            if let Ok(data) = decode::<Value>(token, &key, &v) {
-                let c = data.claims;
-                ensure!(
-                    c["client_id"].as_str() == Some(s.client.as_str())
-                        && c["iat"].as_i64().is_some_and(|i| i <= now() + 1)
-                        && c["jti"].as_str().is_some_and(|s| !s.is_empty()),
-                    "invalid access token claims"
-                );
-                return Ok(c["sub"]
-                    .as_str()
-                    .filter(|x| !x.is_empty())
-                    .context("missing sub")?
-                    .to_owned());
+            let header=URL_SAFE_NO_PAD.decode(encoded).ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+            match header {
+                Some(header) if header.is_object() => {
+                    for field in ["typ","kid"] {
+                        if let Some(value)=header.get(field) && !value.is_string() {
+                            return invalid(field,value.to_string(),"字符串");
+                        }
+                    }
+                    invalid("alg",observed(header.get("alg")),"受支持的 JWT 非对称签名算法")
+                }
+                _=>invalid("JWT header","无法解析标头","Base64url 编码的 JSON 对象"),
+            }
+        })?;
+        if !h.typ.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("at+jwt") || t.eq_ignore_ascii_case("application/at+jwt")) {
+            return Err(invalid("typ", h.typ.as_deref().unwrap_or("（缺失）"), "at+jwt 或 application/at+jwt").into())
+        }
+        if !matches!(h.alg, Algorithm::RS256|Algorithm::RS384|Algorithm::RS512|Algorithm::PS256|Algorithm::PS384|Algorithm::PS512|Algorithm::ES256|Algorithm::ES384|Algorithm::EdDSA) {
+            return Err(invalid("alg",format!("{:?}",h.alg),"RS256/384/512、PS256/384/512、ES256/384 或 EdDSA").into())
+        }
+        let m = self.metadata(s).context("无法读取 IdP 发现文档")?;
+        let keys = self.get(s.epoch, m["jwks_uri"].as_str().context("发现文档缺少 jwks_uri")?).context("无法读取 IdP 公钥")?;
+        let keys=keys["keys"].as_array().context("JWKS 缺少 keys 数组")?;
+        if let Some(kid)=&h.kid && !keys.iter().any(|k|k["kid"].as_str()==Some(kid)) {
+            let ids:Vec<_>=keys.iter().filter_map(|k|k["kid"].as_str()).collect();
+            return Err(invalid("kid",kid,format!("已发布的公钥标识 {ids:?}")).into())
+        }
+        // Verify the signature first. The typed checks below then inspect authenticated claims.
+        let mut v=Validation::new(h.alg);
+        v.required_spec_claims.clear();
+        v.validate_exp=false;
+        v.validate_aud=false;
+        let mut tried=false;
+        for k in keys {
+            if h.kid.as_ref().is_some_and(|id|k["kid"].as_str()!=Some(id))
+                || k["use"].as_str().is_some_and(|u|u!="sig")
+                || k["key_ops"].as_array().is_some_and(|ops|!ops.iter().any(|v|v=="verify"))
+                || k["alg"].as_str().is_some_and(|a|a!=format!("{:?}",h.alg)) {continue}
+            let Ok(jwk)=serde_json::from_value::<Jwk>(k.clone()) else {continue};
+            let Ok(key)=DecodingKey::from_jwk(&jwk) else {continue};
+            tried=true;
+            match decode::<Value>(token,&key,&v) {
+                Ok(data)=>return claims(&data.claims,s),
+                Err(e) if matches!(e.kind(),jsonwebtoken::errors::ErrorKind::Json(_)) =>
+                    return Err(invalid("payload","无法解析 JWT JSON","有效的 JWT 声明对象").into()),
+                Err(_)=>continue,
             }
         }
-        bail!("access token validation failed")
-    }
-    pub fn exchange(&self, s: &Settings, code: &str, verifier: &str) -> Result<String> {
-        let m = self.metadata(s)?;
-        let url = endpoint(
-            m["token_endpoint"]
-                .as_str()
-                .context("missing token endpoint")?,
-        )?;
-        let redirect = format!("{}/", s.public);
-        let response = body(
-            http()?
-                .post(url)
-                .form(&[
-                    ("grant_type", "authorization_code"),
-                    ("client_id", &s.client),
-                    ("code", code),
-                    ("redirect_uri", &redirect),
-                    ("code_verifier", verifier),
-                ])
-                .send()?,
-        )?;
-        Ok(response["access_token"]
-            .as_str()
-            .context("missing access token")?
-            .to_owned())
+        let actual=if tried {"签名未通过验证"} else {"无可用验签公钥"};
+        Err(invalid("signature",actual, format!("可由已配置 IdP 的公钥验证的 {:?} 签名（kid={:?}）",h.alg,h.kid)).into())
     }
 }

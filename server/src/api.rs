@@ -70,10 +70,7 @@ fn authenticate(app: &App, c: &Connection, s: &Settings, credential: &str) -> Re
         });
     }
     let at = credential.strip_prefix("Bearer ").context("unauthorized")?;
-    let sub = app
-        .discovery
-        .verify(s, at)
-        .map_err(|_| anyhow::anyhow!("unauthorized"))?;
+    let sub = app.discovery.verify(s, at)?;
     Ok(Identity {
         issuer: s.issuer.clone(),
         sub,
@@ -133,20 +130,12 @@ pub fn request(app: Arc<App>, op: String, v: Value, credential: String) -> Resul
                     .as_str()
                     .context("missing authorization endpoint")?,
             )?;
+            let token = identity::endpoint(
+                m["token_endpoint"].as_str().context("missing token endpoint")?,
+            )?;
             return Ok(
-                json!({"endpoint":auth.as_str(),"client":s.client,"audience":s.audience,"scope":s.scope,"issuer":s.issuer,"redirect":format!("{}/",s.public),"epoch":s.epoch}),
+                json!({"endpoint":auth.as_str(),"token_endpoint":token.as_str(),"fragment":m["response_modes_supported"].as_array().is_some_and(|modes| modes.iter().any(|mode| mode=="fragment")),"client":s.client,"audience":s.audience,"scope":s.scope,"issuer":s.issuer,"redirect":format!("{}/",s.public),"epoch":s.epoch}),
             );
-        }
-        "exchange" => {
-            ensure!(
-                v["epoch"].as_i64() == Some(s.epoch),
-                "identity provider changed"
-            );
-            let token = app
-                .discovery
-                .exchange(&s, string(&v, "code")?, string(&v, "verifier")?)?;
-            app.discovery.verify(&s, &token)?;
-            return Ok(json!({"token":token}));
         }
         _ => (),
     }

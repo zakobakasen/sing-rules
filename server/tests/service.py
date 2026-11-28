@@ -129,6 +129,15 @@ class Service(unittest.TestCase):
             self.assertIn(str(patch[field]),error["actual"])
             self.assertIn(error["expected"],error["error"])
             self.assertEqual(error["code"],"token_expired" if field=="exp" else "invalid_token")
+        for patch,field in [(dict(sub=""),"sub"),(dict(jti=""),"jti"),(dict(iat="yesterday"),"iat"),(dict(exp=None),"exp"),(dict(aud=["resource",123]),"aud")]:
+            err=self.api("me",auth="Bearer "+self.idp.jwt(**patch),status=401)
+            self.assertEqual(err["field"],field)
+        header,payload,sig=at.split(".")
+        for replacement,field in [(dict(alg="none",typ="at+jwt"),"alg"),(dict(alg="RS256",typ="at+jwt",kid="unknown"),"kid")]:
+            token=b64(json.dumps(replacement).encode())+"."+payload+"."+sig
+            self.assertEqual(self.api("me",auth="Bearer "+token,status=401)["field"],field)
+        tampered=at.rsplit(".",1)[0]+"."+("A" if sig[0]!="A" else "B")+sig[1:]
+        self.assertEqual(self.api("me",auth="Bearer "+tampered,status=401)["field"],"signature")
         self.assertEqual(self.idp.key_reads,1)
         self.api("purge-keys",auth=self.local)
         self.api("me",auth=guest)

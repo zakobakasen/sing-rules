@@ -41,7 +41,8 @@ async function idpTokens(provider, grant, previousRefresh) {
   });
   const data = await response.json();
   if (!response.ok) {
-    const error = new Error(data.error_description || data.error || "IdP 令牌请求失败");
+    const reason = data.error_description || (data.error === "invalid_grant" ? "授权已过期或被 IdP 撤销，请重新登录" : "IdP 令牌请求失败");
+    const error = new Error(data.error ? reason+" ("+data.error+")" : reason);
     error.oauth = data.error;
     throw error;
   }

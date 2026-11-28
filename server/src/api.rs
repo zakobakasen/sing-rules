@@ -131,7 +131,9 @@ pub fn request(app: Arc<App>, op: String, v: Value, credential: String) -> Resul
                     .context("missing authorization endpoint")?,
             )?;
             let token = identity::endpoint(
-                m["token_endpoint"].as_str().context("missing token endpoint")?,
+                m["token_endpoint"]
+                    .as_str()
+                    .context("missing token endpoint")?,
             )?;
             return Ok(
                 json!({"endpoint":auth.as_str(),"token_endpoint":token.as_str(),"fragment":m["response_modes_supported"].as_array().is_some_and(|modes| modes.iter().any(|mode| mode=="fragment")),"client":s.client,"audience":s.audience,"scope":s.scope,"issuer":s.issuer,"redirect":format!("{}/",s.public),"epoch":s.epoch}),

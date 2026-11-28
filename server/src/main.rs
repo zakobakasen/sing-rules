@@ -68,9 +68,12 @@ async fn api(
     let response = match result {
         Ok(Ok(v)) => (StatusCode::OK, Json(v)),
         Ok(Err(e)) if e.is::<identity::TokenError>() => {
-            let t=e.downcast_ref::<identity::TokenError>().unwrap();
-            (StatusCode::UNAUTHORIZED, Json(json!({"error":t.to_string(),"code":t.code,
-                "field":t.field,"actual":t.actual,"expected":t.expected})))
+            let t = e.downcast_ref::<identity::TokenError>().unwrap();
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":t.to_string(),"code":t.code,
+                "field":t.field,"actual":t.actual,"expected":t.expected})),
+            )
         }
         Ok(Err(e)) => {
             let msg = e.to_string();

@@ -64,7 +64,7 @@ def federated_login(browser, origin):
     flow["expired"] = "Bearer second-at"
     page.reload()
     page.locator("#local").wait_for()
-    page.get_by_text("exp 已过期；IdP 刷新失败：invalid_grant",exact=True).wait_for()
+    page.get_by_text("exp 已过期；IdP 刷新失败：授权已过期或被 IdP 撤销，请重新登录 (invalid_grant)",exact=True).wait_for()
     assert grants == ["authorization_code", "refresh_token", "refresh_token"]
     flow["bad_audience"] = True
     page.locator("#idp").click()

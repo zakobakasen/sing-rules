@@ -752,7 +752,9 @@ fn caches_remote_rulesets_across_compiles_and_refreshes_them() {
 
     let cache = project.0.path().join("ruleset-cache");
     let entry = fs::read_dir(cache).unwrap().next().unwrap().unwrap().path();
-    std::fs::File::open(entry)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(entry)
         .unwrap()
         .set_times(
             FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(25 * 3600)),

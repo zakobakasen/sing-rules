@@ -7,6 +7,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -24,6 +25,12 @@ jobs:
           export SING_RULES_SERVER="$PWD/target/release/sing-rules-server"
           "$RUNNER_TEMP/qa/bin/python" -m unittest discover -s server/tests -p '*.py'
           CHROME_BIN="$(command -v google-chrome)" "$RUNNER_TEMP/qa/bin/python" server/tests/browser.py
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install cryptography
+          $env:SING_RULES_SERVER = (Resolve-Path target/release/sing-rules-server.exe).Path
+          python -m unittest discover -s server/tests -p '*.py'
       - uses: actions/upload-artifact@v4
         with:
           name: sing-rules-server-${{ runner.os }}-x64
